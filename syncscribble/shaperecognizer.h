@@ -26,7 +26,7 @@ public:
     static bool isArrow(const std::vector<Point>& points, Point& start, Point& end);
     static bool isArc(const std::vector<Point>& points, Point& start, Point& end, double& bulge);
     static bool isCurvedArrow(const std::vector<Point>& points, Point& start, Point& end, double& bulge);
-    static Point snapLineAngle(Point start, Point end, double thresholdDeg = 6.0);
+    static Point snapLineAngle(Point start, Point end, double thresholdDeg = 3.0);
     static bool calcArcGeometry(Point start, Point end, double bulge,
         Point& center, double& radius, double& startAngle, double& sweepAngle);
 };
