@@ -113,6 +113,13 @@ const char* prefInfoXML = R"#(
       title="Simplification" description="Simplification threshold in 0.05 pixel steps" />
   <pref name="useWintab" type="bool" group="Input"
       title="Use Wintab if available" description="Use Wacom Wintab tablet interface" exclude="mobile,linux,mac" />
+  <pref name="penHaptics" type="bool" group="Input"
+      title="Pen haptic feedback" description="Tactile feedback for Surface Slim Pen 2" exclude="mobile,linux,mac" />
+  <pref name="penHapticStyle" type="int" group="Input" exclude="mobile,linux,mac"
+      enum="Auto (match tool);Ink;Pencil;Marker;Brush;Chisel marker"
+      title="Haptic feedback feel" description="Texture feel while writing" />
+  <pref name="penHapticIntensity" type="int" min="0" max="100" group="Input"
+      title="Haptic intensity" description="Feedback strength percentage (0-100)" exclude="mobile,linux,mac" />
 
   <!-- should be limited to the "chrome", i.e, excluding any behaviors of ScribbleArea -->
   <!-- pref type="label" group="User Interface"

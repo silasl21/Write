@@ -739,6 +739,12 @@ void MainWindow::createToolBars()
   // previously, we supported multiple toolbars, but for now, we only use the first
   auto tbscfg = splitStr<std::vector>(ScribbleApp::cfg->String("toolBars2"), ';', true);
   auto tbcfg = splitStr<std::vector>(tbscfg[0].c_str(), ',', true);
+  if(std::find(tbcfg.begin(), tbcfg.end(), "actionInvertColors") == tbcfg.end()) {
+    auto ov = std::find(tbcfg.begin(), tbcfg.end(), "actionOverflow_Menu");
+    if(ov != tbcfg.begin() && ov != tbcfg.end() && *(ov - 1) == "separator")
+      --ov;
+    tbcfg.insert(ov, "actionInvertColors");
+  }
 
   Toolbar* tb = vertToolbar ? createVertToolbar() : createToolbar();
   Widget* stretch = NULL, *eraseBtn = NULL, *selectBtn = NULL, *insSpaceBtn = NULL, *toolsBtn = NULL;
@@ -939,9 +945,10 @@ void MainWindow::setupActions()
   actionSplitView->addMenuAction(actionSplitV21);
 
   actionInvertColors = createAction("actionInvertColors",
-      "Invert Colors", "", "", [this](){ toggleInvertColors(); });
+      "Dark Page (Invert Colors)", ":/icons/ic_menu_invert.svg", "", [this](){ toggleInvertColors(); });
   actionInvertColors->setCheckable(true);
   actionInvertColors->setChecked(ScribbleApp::cfg->Bool("invertColors"));
+  actionInvertColors->setPriority(Action::NormalPriority - 1);
 
   actionNew_Page_Before = createAction("actionNew_Page_Before",
       "New Page &Before", "", "Ctrl+Shift+Left", SLOT(doCommand(ID_PAGEBEFORE)));
@@ -1023,6 +1030,7 @@ void MainWindow::setupActions()
   actionBookmarksPin->setChecked(!cfg->Bool("autoHideBookmarks"));
 
   actionExport_PDF = createAction("actionExport_PDF", "Export PDF...", "", "", SLOT(exportPDF()));
+  actionImport_PDF = createAction("actionImport_PDF", "Import PDF...", ":/icons/ic_menu_document.svg", "", SLOT(importPDF()));
   // don't use direct connection for prefs because it might destroy the toolbars (which might contain menu
   //  from which it was launched)
   actionPreferences = createAction("actionPreferences",
@@ -1225,6 +1233,7 @@ void MainWindow::setupActions()
   docmenu->addAction(actionSend_HTML);
   docmenu->addAction(actionSend_PDF);
 #else
+  docmenu->addAction(actionImport_PDF);
   docmenu->addAction(actionExport_PDF);
 #endif
 

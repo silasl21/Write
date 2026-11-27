@@ -37,18 +37,46 @@ public:
   StrokeBuilder() : firstProcessor(this) {}
   ~StrokeBuilder() override;
   void addFilter(InputProcessor* p);
-  void addInputPoint(const StrokePoint& pt) { firstProcessor->addPoint(pt); }
+  void addInputPoint(const StrokePoint& pt);
+  void setHoldThreshold(Dim radius) { holdRadius = radius; minRawPointStep = std::max(Dim(0.5), radius * 0.2); }
+  bool isShapeSnapped() const { return shapeSnapped; }
   Element* getElement() { return element; }
   Path2D* getPath() { return stroke; }
   virtual Rect getDirty() { return element->bbox(); }
-  virtual bool shapeRecognize(Timestamp t) { return false; };
+  bool shapeRecognize(Timestamp t);
   Element* finish();  // caller assumes ownership of returned Element
 
   static StrokeBuilder* create(const ScribblePen& pen);
   static Point calcCom(SvgNode* node, Path2D* path);
 
 protected:
+  struct SnappedShape {
+    enum Type { None, Circle, Rectangle, Arrow, Line } type = None;
+    Point p1;
+    Point p2;
+    double radius = 0;
+    Point origP1;
+    Point origP2;
+    double origRadius = 0;
+    Point rectFixedCorner;
+    Point rectDragCorner;
+  };
+
+  bool checkHoldReady(Timestamp now);
+  bool detectSnappedShape(Timestamp now);
+  bool updateSnappedShapeFromPoint(Point p);
+  virtual void rebuildSnappedStroke() {}
+
   Timestamp holdStartTime = 0;
+  std::vector<Point> rawPoints;
+  Point holdAnchor;
+  Point snapPos;
+  Dim holdRadius = 4.0;
+  Dim minRawPointStep = 0.8;
+  bool holdChecked = false;
+  bool shapeSnapped = false;
+  bool shapeResizing = false;
+  SnappedShape snappedShape;
   Element* element;
   Path2D* stroke;
   void finalize() override;
@@ -66,6 +94,7 @@ public:
 protected:
   void addPoint(const StrokePoint& pt) override;
   void removePoints(int n) override;
+  void rebuildSnappedStroke() override;
 
 private:
   Dim width;
@@ -76,7 +105,6 @@ class FilledStrokeBuilder : public StrokeBuilder {
 public:
   FilledStrokeBuilder(const ScribblePen& _pen);
   Rect getDirty() override;
-  bool shapeRecognize(Timestamp t) override;
 
   static void addRoundSubpath(Path2D& path, Point pt1, Dim w1, Point pt2, Dim w2);
   static void addChiselSubpath(Path2D& path, Point pt1, Dim w1, Point pt2, Dim w2);
@@ -85,7 +113,7 @@ public:
 protected:
   void addPoint(const StrokePoint& pt) override;
   void removePoints(int n) override;
-  void finalize() override;
+  void rebuildSnappedStroke() override;
 
 private:
   void assembleFlatStroke();

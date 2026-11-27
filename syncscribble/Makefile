@@ -77,8 +77,12 @@ INCSYS = ../pugixml/src ../stb
 MAJORVER := 3
 MINORVER := 1
 #HGREV := $(shell hg id -n)
-GITREV := $(shell git rev-parse --short HEAD || wsl git rev-parse --short HEAD)
-GITCOUNT := $(shell git rev-list --count HEAD || wsl git rev-list --count HEAD)
+ifndef GITREV
+  GITREV := $(shell git rev-parse --short HEAD || wsl git rev-parse --short HEAD)
+endif
+ifndef GITCOUNT
+  GITCOUNT := $(shell git rev-list --count HEAD || wsl git rev-list --count HEAD)
+endif
 APPVERSION := $(MAJORVER).$(MINORVER).$(GITCOUNT)
 # defines for pugixml config instead of forking whole repo; use external STB libs in nanovg
 DEFS = PUGIXML_NO_XPATH PUGIXML_NO_EXCEPTIONS
@@ -116,7 +120,10 @@ LIBS = \
   advapi32.lib \
   setupapi.lib \
   imm32.lib \
-  version.lib
+  version.lib \
+  comdlg32.lib \
+  hid.lib \
+  cfgmgr32.lib
 
 SDL_LIB ?= ../SDL/Release/SDL2.lib
 LIBS += $(SDL_LIB)

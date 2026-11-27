@@ -1,96 +1,135 @@
 #include "shaperecognizer.h"
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+
+static double clampUnit(double v)
+{
+    return std::max(-1.0, std::min(1.0, v));
+}
+
+static double pointToSegmentDist(const Point& p, const Point& a, const Point& b)
+{
+    double dx = b.x - a.x;
+    double dy = b.y - a.y;
+    double lenSq = dx * dx + dy * dy;
+    if (lenSq <= 1e-12)
+        return p.dist(a);
+    double t = std::max(0.0, std::min(1.0, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq));
+    Point proj(a.x + t * dx, a.y + t * dy);
+    return p.dist(proj);
+}
 
 bool ShapeRecognizer::isCircle(const std::vector<Point> &points, Point &centroid, double &avgRadius)
 {
-    double sumX = 0, sumY = 0;
-    for (const auto& point : points) {
-        sumX += point.x;
-        sumY += point.y;
+    if (points.size() < 10)
+        return false;
+
+    double minX = points[0].x, maxX = points[0].x;
+    double minY = points[0].y, maxY = points[0].y;
+    double pathLen = 0.0;
+    for (size_t i = 0; i < points.size(); ++i) {
+        minX = std::min(minX, points[i].x);
+        maxX = std::max(maxX, points[i].x);
+        minY = std::min(minY, points[i].y);
+        maxY = std::max(maxY, points[i].y);
+        if (i > 0)
+            pathLen += points[i].dist(points[i - 1]);
     }
 
-    centroid = { sumX / points.size(), sumY / points.size() };
+    double w = maxX - minX;
+    double h = maxY - minY;
+    if (w < 12.0 || h < 12.0)
+        return false;
+    if (std::max(w, h) / std::min(w, h) > 1.45)
+        return false;
+
+    centroid = { (minX + maxX) * 0.5, (minY + maxY) * 0.5 };
 
     std::vector<double> distances;
+    distances.reserve(points.size());
     for (const auto& point : points) {
-        double dx = point.x - centroid.x;
-        double dy = point.y - centroid.y;
-        distances.push_back(std::sqrt(dx * dx + dy * dy));
+        distances.push_back(point.dist(centroid));
     }
 
     avgRadius = std::accumulate(distances.begin(), distances.end(), 0.0) / distances.size();
+    if (avgRadius < 8.0)
+        return false;
 
-    double variance = 0;
+    if (points.front().dist(points.back()) >= avgRadius * 1.0)
+        return false;
+
+    if (pathLen < 2.0 * M_PI * avgRadius * 0.75)
+        return false;
+
+    double variance = 0.0;
     for (double d : distances) {
-        variance += (d - avgRadius) * (d - avgRadius);
+        double diff = d - avgRadius;
+        variance += diff * diff;
     }
     variance /= distances.size();
 
     double stddev = std::sqrt(variance);
-    double ratio = stddev / avgRadius;
-
-    double threshold = 0.13;
-    printf("Circle: StdDev %.5f, AvgRadius %.5f, Ratio %.5f\n", stddev, avgRadius, ratio);
-
-    return ratio < threshold;
+    return (stddev / avgRadius) < 0.14;
 }
 
-bool ShapeRecognizer::isLine(const std::vector<Point>& points, Point& start, Point& end) {
-    double sumX = 0, sumY = 0;
+bool ShapeRecognizer::isLine(const std::vector<Point>& points, Point& start, Point& end)
+{
+    if (points.size() < 4)
+        return false;
+
+    start = points.front();
+    end = points.back();
+    double dx = end.x - start.x;
+    double dy = end.y - start.y;
+    double span = std::hypot(dx, dy);
+    if (span < 15.0)
+        return false;
+
+    double ux = dx / span;
+    double uy = dy / span;
+    double sumSq = 0.0;
+    double maxPerp = 0.0;
+
     for (const auto& p : points) {
-        sumX += p.x;
-        sumY += p.y;
-    }
-    double meanX = sumX / points.size();
-    double meanY = sumY / points.size();
+        double rx = p.x - start.x;
+        double ry = p.y - start.y;
+        double proj = (rx * ux + ry * uy) / span;
+        if (proj < -0.1 || proj > 1.1)
+            return false;
 
-    double num = 0, den = 0;
-    for (const auto& p : points) {
-        num += (p.x - meanX) * (p.y - meanY);
-        den += (p.x - meanX) * (p.x - meanX);
-    }
-
-    if (den == 0) {
-        start = { meanX, points.front().y };
-        end = { meanX, points.back().y };
-        return true;
+        double perp = std::abs(rx * (-uy) + ry * ux);
+        sumSq += perp * perp;
+        maxPerp = std::max(maxPerp, perp);
     }
 
-    double slope = num / den;
-    double intercept = meanY - slope * meanX;
-
-    double sumSquaredDistances = 0;
-    for (const auto& p : points) {
-        double expectedY = slope * p.x + intercept;
-        double distance = std::abs(expectedY - p.y) / std::sqrt(1 + slope * slope);
-        sumSquaredDistances += distance * distance;
-    }
-    double rmse = std::sqrt(sumSquaredDistances / points.size());
-
-    double span = std::hypot(points.back().x - points.front().x, points.back().y - points.front().y);
-    double threshold = span * 0.05;
-    printf("Line: RMSE %.5f, Span %.5f, Threshold %.5f\n", rmse, span, threshold);
-    if (rmse > threshold) return false;
-
-    auto project = [&](const Point& p) -> Point {
-        double x = (p.x + slope * (p.y - intercept)) / (1 + slope * slope);
-        double y = slope * x + intercept;
-        return { x, y };
-    };
-
-    start = project(points.front());
-    end   = project(points.back());
-
-    return true;
+    double rmse = std::sqrt(sumSq / points.size());
+    return rmse < std::max(2.0, span * 0.05) && maxPerp < std::max(5.0, span * 0.12);
 }
 
-bool ShapeRecognizer::isRectangle(const std::vector<Point>& points, std::vector<Point>& outCorners) {
-    Point centroid{0, 0};
+bool ShapeRecognizer::isRectangle(const std::vector<Point>& points, std::vector<Point>& outCorners)
+{
+    if (points.size() < 10)
+        return false;
+
+    double minX = points[0].x, maxX = points[0].x;
+    double minY = points[0].y, maxY = points[0].y;
     for (const auto& p : points) {
-        centroid.x += p.x;
-        centroid.y += p.y;
+        minX = std::min(minX, p.x);
+        maxX = std::max(maxX, p.x);
+        minY = std::min(minY, p.y);
+        maxY = std::max(maxY, p.y);
     }
-    centroid.x /= points.size();
-    centroid.y /= points.size();
+
+    double w = maxX - minX;
+    double h = maxY - minY;
+    if (w < 12.0 || h < 12.0)
+        return false;
+
+    Point centroid = { (minX + maxX) * 0.5, (minY + maxY) * 0.5 };
+
+    if (points.front().dist(points.back()) >= std::max(20.0, 0.45 * std::hypot(w, h)))
+        return false;
 
     std::vector<Point> corners(4);
     double maxDists[4] = {0, 0, 0, 0};
@@ -107,6 +146,17 @@ bool ShapeRecognizer::isRectangle(const std::vector<Point>& points, std::vector<
         }
     }
 
+    for (int q = 0; q < 4; ++q) {
+        if (maxDists[q] <= 0.0)
+            return false;
+    }
+
+    double halfDiag = 0.5 * std::hypot(w, h);
+    double avgCornerDist = (corners[0].dist(centroid) + corners[1].dist(centroid) +
+                            corners[2].dist(centroid) + corners[3].dist(centroid)) * 0.25;
+    if (halfDiag <= 1e-6 || (avgCornerDist / halfDiag) < 0.83)
+        return false;
+
     std::sort(corners.begin(), corners.end(), [&centroid](const Point& a, const Point& b) {
         double angleA = std::atan2(a.y - centroid.y, a.x - centroid.x);
         double angleB = std::atan2(b.y - centroid.y, b.x - centroid.x);
@@ -120,73 +170,85 @@ bool ShapeRecognizer::isRectangle(const std::vector<Point>& points, std::vector<
         Point b = corners[(i + 1) % 4];
         Point c = corners[(i + 2) % 4];
 
-        double dx = b.x - a.x;
-        double dy = b.y - a.y;
-        sides[i] = std::hypot(dx, dy);
+        sides[i] = a.dist(b);
+        if (sides[i] < 8.0)
+            return false;
 
         double dx1 = a.x - b.x;
         double dy1 = a.y - b.y;
         double dx2 = c.x - b.x;
         double dy2 = c.y - b.y;
 
-        double dot = dx1 * dx2 + dy1 * dy2;
         double mag1 = std::hypot(dx1, dy1);
         double mag2 = std::hypot(dx2, dy2);
-        angles[i] = std::acos(dot / (mag1 * mag2)) * 180.0 / M_PI;
+        if (mag1 <= 1e-6 || mag2 <= 1e-6)
+            return false;
+
+        double dot = dx1 * dx2 + dy1 * dy2;
+        angles[i] = std::acos(clampUnit(dot / (mag1 * mag2))) * 180.0 / M_PI;
     }
 
-    double sideTol = 0.2 * ((sides[0] + sides[2]) / 2);
-    double angleTol = 15.0;
-
-    bool sidesEqual = std::abs(sides[0] - sides[2]) < sideTol &&
-                      std::abs(sides[1] - sides[3]) < sideTol;
-    bool anglesRight = std::all_of(angles, angles + 4, [=](double angle) {
-        return std::abs(angle - 90.0) < angleTol;
+    bool sidesEqual = std::abs(sides[0] - sides[2]) < 0.30 * ((sides[0] + sides[2]) * 0.5) &&
+                      std::abs(sides[1] - sides[3]) < 0.30 * ((sides[1] + sides[3]) * 0.5);
+    bool anglesRight = std::all_of(angles, angles + 4, [](double angle) {
+        return std::abs(angle - 90.0) < 25.0;
     });
+    if (!sidesEqual || !anglesRight)
+        return false;
 
-    bool closedFigure = points.front().dist(points.back()) < 0.5 * points.front().dist(centroid);
+    double edgeDistSum = 0.0;
+    for (const auto& p : points) {
+        double minEdgeDist = pointToSegmentDist(p, corners[0], corners[1]);
+        for (int i = 1; i < 4; ++i)
+            minEdgeDist = std::min(minEdgeDist, pointToSegmentDist(p, corners[i], corners[(i + 1) % 4]));
+        edgeDistSum += minEdgeDist;
+    }
+    double avgEdgeDist = edgeDistSum / points.size();
+    if (avgEdgeDist >= std::max(4.0, 0.14 * std::min(w, h)))
+        return false;
 
-    printf("Rectangle: Closed=%s, SidesEqual=%s, AnglesRight=%s\n", 
-        closedFigure ? "true" : "false", sidesEqual ? "true" : "false", anglesRight ? "true" : "false");
-    
     outCorners = corners;
-    return sidesEqual && anglesRight && closedFigure;
+    return true;
 }
 
+bool ShapeRecognizer::isArrow(const std::vector<Point>& points, Point& start, Point& end)
+{
+    if (points.size() < 8)
+        return false;
 
-bool ShapeRecognizer::isArrow(const std::vector<Point>& points, Point& start, Point& end) {
-    size_t splitIndex = points.size() * 2 / 3;
-    if (splitIndex >= points.size() - 2) splitIndex = points.size() - 3;
+    size_t tipIdx = points.size() / 2;
+    double maxDist = -1.0;
+    for (size_t i = points.size() / 2; i + 1 < points.size(); ++i) {
+        double d = points[i].dist(points.front());
+        if (d > maxDist) {
+            maxDist = d;
+            tipIdx = i;
+        }
+    }
 
-    std::vector<Point> shaft(points.begin(), points.begin() + splitIndex);
-    std::vector<Point> head(points.begin() + splitIndex, points.end());
+    std::vector<Point> shaft(points.begin(), points.begin() + tipIdx + 1);
+    std::vector<Point> head(points.begin() + tipIdx, points.end());
+    if (shaft.size() < 4 || head.size() < 3)
+        return false;
 
-    if (!isLine(shaft, start, end)) return false;
+    if (!isLine(shaft, start, end))
+        return false;
 
-    auto vec = [](const Point& a, const Point& b) {
-        return std::pair<double, double>{b.x - a.x, b.y - a.y};
-    };
+    double shaftLen = start.dist(end);
+    if (shaftLen < 20.0)
+        return false;
 
-    auto normalize = [](std::pair<double, double> v) {
-        double len = std::hypot(v.first, v.second);
-        return std::pair<double, double>{v.first / len, v.second / len};
-    };
+    double headDx = points.back().x - end.x;
+    double headDy = points.back().y - end.y;
+    double headLen = std::hypot(headDx, headDy);
+    if (headLen < std::max(8.0, 0.08 * shaftLen) || headLen > 0.65 * shaftLen)
+        return false;
 
-    auto dot = [](std::pair<double, double> u, std::pair<double, double> v) {
-        return u.first * v.first + u.second * v.second;
-    };
+    double ux = (end.x - start.x) / shaftLen;
+    double uy = (end.y - start.y) / shaftLen;
+    double vx = headDx / headLen;
+    double vy = headDy / headLen;
 
-    Point shaftStart = shaft.front(), shaftEnd = shaft.back();
-    Point headStart = head.front(), headEnd = head.back();
-
-    auto dir1 = normalize(vec(shaftStart, shaftEnd));
-    auto dir2 = normalize(vec(headStart, headEnd));
-
-    double angleCos = dot(dir1, dir2);
-    double angleDeg = std::acos(angleCos) * 180.0 / M_PI;
-
-    printf("Arrow: shaft-head angle: %.2f\n", angleDeg);
-
-    return angleDeg > 140.0 && angleDeg < 160.0;
+    double angleDeg = std::acos(clampUnit(ux * vx + uy * vy)) * 180.0 / M_PI;
+    return angleDeg >= 115.0 && angleDeg <= 170.0;
 }
-

@@ -75,6 +75,7 @@ public:
   void openRecentFile(const std::string& filename);
   void createLink();
   void exportPDF();
+  bool importPDF(const std::string& destDir = "");
   void insertImage();
   void insertImage(const std::string& filename);
   void insertImage(Image image, bool fromintent = false);
@@ -144,7 +145,7 @@ public:
   bool hasI18n = false;
   static Uint32 scribbleSDLEvent;
   enum scribbleSDLEventCode {INSERT_IMAGE=1, UPDATE_CHECK,
-      STORAGE_PERMISSION, DISMISS_DIALOG, SIMULATE_PEN_BTN, IAP_COMPLETE, APP_SUSPEND};
+      STORAGE_PERMISSION, DISMISS_DIALOG, SIMULATE_PEN_BTN, IAP_COMPLETE, APP_SUSPEND, IMPORT_PDF_DONE};
 
   ScribbleArea* activeArea() const { return mActiveArea; }
   ScribbleDoc* activeDoc() const;
@@ -200,6 +201,7 @@ private:
   bool backToDocList = true;
   bool delayedShowDocList = false;
   bool disableConfigSave = false;
+  bool pdfImportInProgress = false;
   size_t historyPos = 0;  // used in penChanged
 
   bool maybeSave(bool prompt = false);

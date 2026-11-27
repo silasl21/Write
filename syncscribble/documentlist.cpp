@@ -59,6 +59,8 @@ void DocumentList::createUI()
 
   newDocBtn = createToolbutton(SvgGui::useFile("icons/ic_menu_add_doc.svg"), _("New Document"), true);
   newDocBtn->onClicked = [this](){ newDoc(); };
+  importPdfBtn = createToolbutton(SvgGui::useFile("icons/ic_menu_document.svg"), _("Import PDF"), true);
+  importPdfBtn->onClicked = [this](){ selectedFile = currDir.c_str(); finish(IMPORT_PDF); };
   newFolderBtn = createToolbutton(SvgGui::useFile("icons/ic_menu_add_folder.svg"), _("New Folder"));
   newFolderBtn->onClicked = [this](){ newFolder(); };
   helpBtn = createToolbutton(SvgGui::useFile("icons/ic_menu_help.svg"), _("Help"));
@@ -116,6 +118,7 @@ void DocumentList::createUI()
   mainToolbar->addWidget(stretch);
   mainToolbar->addWidget(saveHereBtn);
   mainToolbar->addWidget(newDocBtn);
+  mainToolbar->addWidget(importPdfBtn);
   mainToolbar->addWidget(newFolderBtn);
   if(IS_DEBUG || !PLATFORM_IOS || ScribbleApp::cfg->String("syncServer", "")[0])
     mainToolbar->addWidget(whiteboardBtn);
@@ -130,12 +133,15 @@ void DocumentList::createUI()
       return;
     // reset
     newDocBtn->setShowTitle(true);
+    importPdfBtn->setShowTitle(true);
     for(auto& bc : breadCrumbs)
       bc->setShowTitle(true);
     adjtb->repeatLayout(dest);
     int bcidx = breadCrumbs.size();
     while(stretch->node->bounds().width() < 1) {
-      if(newDocBtn->selectFirst(".title")->isVisible())
+      if(importPdfBtn->isVisible() && importPdfBtn->selectFirst(".title")->isVisible())
+        importPdfBtn->setShowTitle(false);
+      else if(newDocBtn->selectFirst(".title")->isVisible())
         newDocBtn->setShowTitle(false);
       else if(--bcidx >= 0)
         breadCrumbs[bcidx]->setShowTitle(false);
@@ -326,6 +332,7 @@ void DocumentList::setup(Window* parent, Mode_t mode, const char* exts, bool can
 
   // show/hide buttons depending on mode
   newDocBtn->setVisible(mode == OPEN_DOC);
+  importPdfBtn->setVisible(mode == OPEN_DOC);
   newFolderBtn->setVisible(!chooseOnly);
   helpBtn->setVisible(mode == OPEN_DOC);
   if(whiteboardBtn)

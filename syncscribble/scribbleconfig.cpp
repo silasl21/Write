@@ -70,6 +70,11 @@ void ScribbleConfig::init()
 
   // 1 = use Wintab instead of WM_POINTER if available; can we be sure WM_POINTER works for all USB tablets?
   cfg["useWintab"] = 1;
+  // Windows 11 Surface Pen / RadialController haptics (requires WM_POINTER / PenDevice)
+  cfg["penHaptics"] = 1;
+  // 0 = Auto (matches current tool), 1 = Ink, 2 = Pencil, 3 = Marker, 4 = Brush, 5 = Chisel
+  cfg["penHapticStyle"] = 0;
+  cfg["penHapticIntensity"] = 75;
 
   // 1 = swipe in from edge of screen to pan - not very useful on windows since win 8 uses swipes
   // 2 = pen down off page pans (undocumented)
@@ -246,11 +251,11 @@ void ScribbleConfig::init()
   //cfgS["toolBars"] = "docTitle,stretch,tools,undoRedoBtn,"
   //    "actionSelection_Menu,actionShow_Bookmarks,actionShow_Clippings,actionSplitView,actionOverflow_Menu";
   cfgS["toolBars2"] = "docTitle,stretch,tools,separator,undoRedoBtn,separator,seltools,"
-    "separator,actionShow_Bookmarks,actionShow_Clippings,actionSplitView,separator,actionOverflow_Menu";
+    "separator,actionShow_Bookmarks,actionShow_Clippings,actionSplitView,actionInvertColors,separator,actionOverflow_Menu";
 #else
   // appropriate for Surface Pro portrait display
   cfgS["toolBars2"] = "docTitle,stretch,actionSave,separator,tools,separator,undoRedoBtn,separator,seltools,"
-    "separator,actionShow_Bookmarks,actionShow_Clippings,actionSplitView,separator,actionOverflow_Menu";
+    "separator,actionShow_Bookmarks,actionShow_Clippings,actionSplitView,actionInvertColors,separator,actionOverflow_Menu";
 #endif
   // strftime format string for doc title
   cfgS["newDocTitleFmt"] = "%b %e %Hh%M";

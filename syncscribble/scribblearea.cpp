@@ -6,6 +6,9 @@
 #include "scribblewidget.h"
 #include "strokebuilder.h"
 #include "bookmarkview.h"
+#if PLATFORM_WIN
+#include "windows/winhelper.h"
+#endif
 
 
 const Dim ScribbleArea::ERASESTROKE_RADIUS = 7;
@@ -1476,6 +1479,7 @@ void ScribbleArea::doPressEvent(const InputEvent& event)
     StrokeBuilder* builder = StrokeBuilder::create(*pen);
     // install filters
     if(!lineDrawing) {
+      builder->setHoldThreshold(std::max(Dim(2.0), Dim(6.0) / mZoom));
       // reasonable values are inputSimplify = 2 (0.1 pixel) and inputSmoothing = 5
       Dim simp = cfg->Int("inputSimplify")*0.05/mZoom;
       if(simp > 0)
@@ -1634,8 +1638,9 @@ void ScribbleArea::doPressEvent(const InputEvent& event)
   initialPos = pos;
   prevRawPos = rawpos;
 
-  if(currMode != MODE_STROKE && widget)
-    widget->startTimer(timerPeriod);  // for autoscroll
+  if(widget && (currMode != MODE_STROKE ||
+      (!currPen()->hasFlag(ScribblePen::LINE_DRAWING) && !currPen()->hasFlag(ScribblePen::SNAP_TO_GRID))))
+    widget->startTimer(timerPeriod);  // for autoscroll or hold-to-shape
 }
 
 void ScribbleArea::doMoveEvent(const InputEvent& event)
@@ -2330,6 +2335,20 @@ void ScribbleArea::doCancelAction(bool refresh)
 bool ScribbleArea::doTimerEvent(Timestamp t)
 {
   bool res = ScribbleView::doTimerEvent(t);
+  if(currMode == MODE_STROKE && scribbleDoc && scribbleDoc->strokeBuilder) {
+    if(!scribbleDoc->strokeBuilder->isShapeSnapped()) {
+      if(scribbleDoc->strokeBuilder->shapeRecognize(mSecSinceEpoch())) {
+#if PLATFORM_WIN
+        winTriggerPenHapticClick();
+#endif
+        scribbleDoc->updateCurrStroke(scribbleDoc->strokeBuilder->getDirty());
+        doRefresh();
+        return res;
+      }
+      return true;
+    }
+    return res;
+  }
   // previously, we had config flags for erase, select, move sel and ins space - but these were never touched,
   //  so just hard code for select and move sel w/ a single flag
   if(!cfg->Bool("autoScrollSelect"))
@@ -2577,9 +2596,17 @@ void ScribbleArea::drawWatermark(Painter* painter, Page* page, const Rect& dirty
 //  boundaries from some stuff being antialiased but other stuff not, non-pixel aligned boundaries, etc.
 void ScribbleArea::drawImage(Painter* painter, const Rect& dirty)
 {
-  // draw the gray background
+  // draw the gray background (keep workspace dark outside pages when inverting colors)
   painter->setAntiAlias(false);
-  painter->fillRect(dirty, BACKGROUND_COLOR);
+  if(ScribbleApp::cfg->Bool("invertColors")) {
+    painter->save();
+    painter->setColorInvertMode(0);
+    painter->setColorXorMask(0);
+    painter->fillRect(dirty, Color(0xFF121212));
+    painter->restore();
+  }
+  else
+    painter->fillRect(dirty, BACKGROUND_COLOR);
   painter->setAntiAlias(true);
 
   // handle special case of dirty rect limited to current page

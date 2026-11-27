@@ -1,4 +1,5 @@
 #include <fstream>
+#include <thread>
 #include <time.h>
 
 #include "scribbleapp.h"
@@ -34,6 +35,51 @@ MainWindow* ScribbleApp::win = NULL;
 ScribbleConfig* ScribbleApp::cfg = NULL;
 Dialog* ScribbleApp::currDialog = NULL;
 Uint32 ScribbleApp::scribbleSDLEvent = 0;
+
+static bool pendingVectorBackground = false;
+
+#if PLATFORM_WIN
+static void syncWinPenHaptics(ScribbleConfig* cfg, ScribbleMode* scribbleMode, const ScribblePen& currPen)
+{
+  bool enabled = cfg ? cfg->Bool("penHaptics") : true;
+  int rawIntensity = cfg ? cfg->Int("penHapticIntensity") : 75;
+  double intensity = std::max(0, std::min(100, rawIntensity)) / 100.0;
+  winSetPenHapticsConfig(enabled, intensity);
+
+  WinPenHapticTool tool = PEN_HAPTIC_NONE;
+  if(scribbleMode) {
+    int m = ScribbleMode::getModeType(scribbleMode->getMode());
+    if(m == MODE_ERASE)
+      tool = PEN_HAPTIC_ERASER;
+    else if(m == MODE_STROKE) {
+      int style = cfg ? cfg->Int("penHapticStyle") : 0;
+      switch(style) {
+      case 1: tool = PEN_HAPTIC_INK; break;
+      case 2: tool = PEN_HAPTIC_PENCIL; break;
+      case 3: tool = PEN_HAPTIC_MARKER; break;
+      case 4: tool = PEN_HAPTIC_BRUSH; break;
+      case 5: tool = PEN_HAPTIC_CHISEL; break;
+      default:  // Auto: match active pen (marker/highlighter vs chisel vs ink)
+        if(currPen.hasFlag(ScribblePen::DRAW_UNDER) || currPen.color.alpha() < 255)
+          tool = currPen.hasFlag(ScribblePen::TIP_CHISEL) ? PEN_HAPTIC_CHISEL : PEN_HAPTIC_MARKER;
+        else if(currPen.hasFlag(ScribblePen::TIP_CHISEL))
+          tool = PEN_HAPTIC_CHISEL;
+        else
+          tool = PEN_HAPTIC_INK;
+        break;
+      }
+    }
+  }
+  winSetPenHapticsTool(tool);
+}
+#endif
+
+struct PdfImportResult {
+  bool ok = false;
+  bool isVector = false;
+  std::string outputPath;
+  std::string errorMsg;
+};
 
 ScribbleApp::ScribbleApp(int argc, char* argv[])
 {
@@ -485,6 +531,9 @@ void ScribbleApp::loadConfig()
       return autoSaveInterval;
     });
   }
+#if PLATFORM_WIN
+  syncWinPenHaptics(cfg, scribbleMode, currPen);
+#endif
 }
 
 void ScribbleApp::saveConfig()
@@ -738,6 +787,22 @@ bool ScribbleApp::sdlEventHandler(SDL_Event* event)
         std::unique_ptr<Image> image(static_cast<Image*>(event->user.data1));
         bool fromintent = event->user.data2;
         insertImage(std::move(*image), fromintent);
+      }
+      else if(event->user.code == IMPORT_PDF_DONE) {
+        pdfImportInProgress = false;
+        std::unique_ptr<PdfImportResult> res(static_cast<PdfImportResult*>(event->user.data1));
+        dismissNotify();
+        if(res && res->ok && FSPath(res->outputPath).exists()) {
+          pendingVectorBackground = res->isVector;
+          bool opened = openDocument(res->outputPath);
+          pendingVectorBackground = false;
+          if(opened)
+            showNotify(fstring(_("Imported PDF: %s"), docDisplayName(res->outputPath).c_str()), 1);
+        }
+        else {
+          std::string msg = res && !res->errorMsg.empty() ? res->errorMsg : _("Unknown error converting PDF.");
+          messageBox(Error, _("Import PDF"), fstring(_("Failed to convert PDF:\n%s"), msg.c_str()));
+        }
       }
       else if(event->user.code == DISMISS_DIALOG) {
         if(currDialog)
@@ -1266,6 +1331,9 @@ void ScribbleApp::setPen(const ScribblePen& pen)
   // must manually dirty buttons using icon since icon is not part of GUI doc (it's <use>d)
   for(Button* btn : win->actionDraw->buttons)
     btn->node->setDirty(SvgNode::PIXELS_DIRTY);
+#if PLATFORM_WIN
+  syncWinPenHaptics(cfg, scribbleMode, currPen);
+#endif
 }
 
 void ScribbleApp::updatePenToolbar()
@@ -1322,6 +1390,9 @@ void ScribbleApp::getScreenPageDims(int* w, int* h)
 void ScribbleApp::refreshUI(ScribbleDoc* doc, int reason)
 {
   win->refreshUI(doc, reason);
+#if PLATFORM_WIN
+  syncWinPenHaptics(cfg, scribbleMode, currPen);
+#endif
 }
 
 // newdoc means change of Document or of ScribbleDoc - in either case we want to reset scroll position
@@ -1353,6 +1424,9 @@ void ScribbleApp::setMode(int mode)
   }
   scribbleMode->setMode(mode);
   win->updateMode();
+#if PLATFORM_WIN
+  syncWinPenHaptics(cfg, scribbleMode, currPen);
+#endif
 }
 
 void ScribbleApp::hideBookmarks()
@@ -1486,6 +1560,10 @@ bool ScribbleApp::openOrCreateDoc(bool cancelable)
     //cfg->set("currFolder", filename.c_str());
     if(!openSharedDoc())
       return openOrCreateDoc(cancelable);  // try again
+  }
+  else if(res == DocumentList::IMPORT_PDF) {
+    if(!importPDF(filename))
+      return openOrCreateDoc(cancelable);
   }
   else if(res == DocumentList::EXISTING_DOC) {
     //if(scribbleDoc->fileName != documentList->selectedFile || getFileMTime(currFileName.c_str()) != currFileLastMod)
@@ -1767,6 +1845,19 @@ bool ScribbleApp::doOpenDocument(IOStream* filestrm)
 // handle opening external SVG (vs. importExternalDoc, which handles loading external doc to Clipboard)
 bool ScribbleApp::openExternalDoc()
 {
+  if(pendingVectorBackground) {
+    pendingVectorBackground = false;
+    for(Page* page : activeDoc()->document->pages)
+      page->contentToRuling();
+    activeDoc()->repaintAll();
+    if(!activeDoc()->saveDocument((IOStream*)NULL, Document::SAVE_FORCE)) {
+      messageBox(Error, _("Import PDF"), _("Error saving converted Write document."));
+      return false;
+    }
+    onLoadFile(activeDoc()->fileName());
+    return true;
+  }
+
   auto choice = messageBox(Warning, _("Foreign document"), _("This file does not appear to be a Write document."
       "  Saving with Write could result in data loss - you will be prompted to save a copy."),
       {_("Use as background"), _("Ungroup all"), _("No change")});
@@ -2145,6 +2236,190 @@ void ScribbleApp::exportPDF()
     messageBox(Error, _("Export PDF"), _("Error saving document. Please try a different folder."));
 }
 #endif
+
+static std::string toForwardSlashes(std::string s)
+{
+  for(char& c : s) {
+    if(c == '\\') c = '/';
+  }
+  return s;
+}
+
+bool ScribbleApp::importPDF(const std::string& destDir)
+{
+  if(pdfImportInProgress) {
+    showNotify(_("PDF import already in progress..."), 1);
+    return true;
+  }
+
+  std::string initDir = !destDir.empty() ? destDir : cfg->String("currFolder", "");
+#if PLATFORM_WIN
+  std::string pdfPath = winOpenPdfDialog(sdlWindow, initDir.empty() ? NULL : initDir.c_str());
+#else
+  std::string pdfPath = execDocumentList(DocumentList::CHOOSE_DOC, "pdf");
+#endif
+  if(pdfPath.empty())
+    return false;
+
+  FSPath pdfInfo(pdfPath);
+  Dialog* dialog = createDialog(_("Import PDF"));
+  Widget* dialogBody = dialog->selectFirst(".body-container");
+  dialogBody->setMargins(12);
+
+  SvgRect* minWidthRect = new SvgRect(Rect::wh(320, 1));
+  minWidthRect->setAttr<color_t>("fill", Color::NONE);
+  dialogBody->addWidget(new Widget(minWidthRect));
+
+  std::string prompt = fstring(_("Import \"%s\":"), pdfInfo.fileName().c_str());
+  SvgText* msgNode = createTextNode(prompt.c_str());
+  Widget* msgWidget = new Widget(msgNode);
+  msgWidget->setMargins(0, 0, 8, 0);
+  dialogBody->addWidget(msgWidget);
+  std::string wrapped = SvgPainter::breakText(msgNode, 0.8 * win->winBounds().width());
+  if(wrapped != prompt) {
+    msgNode->clearText();
+    msgNode->addText(wrapped.c_str());
+  }
+
+  bool useVector = false;
+  Button* rbLight = createCheckBoxMenuItem(_("Light (Images)"), "#radiobutton");
+  Button* rbVector = createCheckBoxMenuItem(_("Vector"), "#radiobutton");
+  rbLight->node->setAttribute("box-anchor", "hfill");
+  rbVector->node->setAttribute("box-anchor", "hfill");
+  rbLight->setMargins(2, 0, 2, 0);
+  rbVector->setMargins(2, 0, 2, 0);
+  rbLight->setChecked(true);
+  rbVector->setChecked(false);
+  rbLight->onClicked = [&useVector, rbLight, rbVector]() {
+    useVector = false;
+    rbLight->setChecked(true);
+    rbVector->setChecked(false);
+  };
+  rbVector->onClicked = [&useVector, rbLight, rbVector]() {
+    useVector = true;
+    rbLight->setChecked(false);
+    rbVector->setChecked(true);
+  };
+  dialogBody->addWidget(rbLight);
+  dialogBody->addWidget(rbVector);
+
+  Widget* nameLabel = new Widget(createTextNode(_("Output name (blank for default):")));
+  nameLabel->setMargins(10, 0, 4, 0);
+  dialogBody->addWidget(nameLabel);
+
+  TextEdit* nameEdit = createTextEdit();
+  setMinWidth(nameEdit, 260);
+  nameEdit->setText("");
+
+  SvgText* extNode = createTextNode(".svgz");
+  extNode->addClass("weak");
+  Widget* extWidget = new Widget(extNode);
+  extWidget->setMargins(0, 0, 0, 6);
+
+  Widget* nameRow = createRow({}, "0 0");
+  nameRow->addWidget(nameEdit);
+  nameRow->addWidget(extWidget);
+  dialogBody->addWidget(nameRow);
+
+  Toolbar* msgBar = createToolbar();
+  msgBar->setVisible(false);
+  msgBar->node->addClass("warning");
+  msgBar->addWidget(new Widget(createTextNode("")));
+  dialogBody->addWidget(msgBar);
+
+  Button* importBtn = dialog->addButton(_("Import"), [dialog](){ dialog->finish(Dialog::ACCEPTED); });
+  Button* cancelBtn = dialog->addButton(_("Cancel"), [dialog](){ dialog->finish(Dialog::CANCELLED); });
+  dialog->acceptBtn = importBtn;
+  dialog->cancelBtn = cancelBtn;
+  dialog->focusedWidget = nameEdit;
+
+  nameEdit->onChanged = [dialog, msgBar, importBtn](const char* s) {
+    bool invalid = strpbrk(s, PLATFORM_WIN ? "\\/:*?\"<>|" : "/") != NULL;
+    if(msgBar->isVisible() != invalid)
+      dialog->setWinBounds(Rect::centerwh(dialog->winBounds().center(), dialog->winBounds().width(), 0));
+    if(invalid)
+      msgBar->setText(_("Invalid characters in name"));
+    msgBar->setVisible(invalid);
+    importBtn->setEnabled(!invalid);
+  };
+
+  Dialog* prevDialog = currDialog;
+  currDialog = dialog;
+  int dlgRes = execDialog(dialog);
+  currDialog = prevDialog;
+  std::string customName = StringRef(nameEdit->text()).trimmed().toString();
+  delete dialog;
+
+  if(dlgRes != Dialog::ACCEPTED)
+    return false;
+
+  if(!customName.empty()) {
+    std::string lowerName = toLower(customName);
+    if(StringRef(lowerName).endsWith(".svgz"))
+      customName.resize(customName.size() - 5);
+    else if(StringRef(lowerName).endsWith(".svg"))
+      customName.resize(customName.size() - 4);
+  }
+
+  FSPath outFolder = (!destDir.empty() && FSPath(destDir).isDir()) ? FSPath(destDir) : pdfInfo.parent();
+  std::string baseName = !customName.empty() ? customName : (pdfInfo.baseName() + (useVector ? "_vector" : "_write"));
+  std::string stem = baseName;
+  FSPath outInfo = outFolder.child(stem + ".svgz");
+  for(int suffix = 2; outInfo.exists() || outFolder.child(stem + ".svg").exists(); ++suffix) {
+    stem = fstring("%s (%d)", baseName.c_str(), suffix);
+    outInfo = outFolder.child(stem + ".svgz");
+  }
+
+  std::string pdfPathSlash = toForwardSlashes(pdfPath);
+  std::string outPathSlash = toForwardSlashes(outInfo.c_str());
+
+#if PLATFORM_WIN
+  std::string fullCmd;
+  if(useVector) {
+    std::string cmd = cfg->String("pdfVectorImportCmd", "");
+    if(cmd.empty()) {
+      FSPath bundled(Application::appDir, "pdf2write.cmd");
+      if(bundled.exists())
+        cmd = bundled.c_str();
+      else
+        cmd = FSPath("C:/Tools/pdf2write.cmd").exists() ? "C:\\Tools\\pdf2write.cmd" : "pdf2write";
+    }
+    fullCmd = "cmd.exe /c \"\"" + cmd + "\" --vector -o \"" + outPathSlash + "\" \"" + pdfPathSlash + "\"\"";
+  }
+  else {
+    std::string cmd = cfg->String("pdfImportCmd", "");
+    if(cmd.empty()) {
+      FSPath bundled(Application::appDir, "pdf2lightwrite.cmd");
+      if(bundled.exists())
+        cmd = bundled.c_str();
+      else
+        cmd = FSPath("C:/Tools/pdf2lightwrite.cmd").exists() ? "C:\\Tools\\pdf2lightwrite.cmd" : "pdf2lightwrite";
+    }
+    fullCmd = "cmd.exe /c \"\"" + cmd + "\" \"" + pdfPathSlash + "\" \"" + outPathSlash + "\"\"";
+  }
+
+  const char* modeLabel = useVector ? _("Vector") : _("Light");
+  pdfImportInProgress = true;
+  showNotify(fstring(_("Converting PDF (%s): %s..."), modeLabel, pdfInfo.fileName().c_str()), 1);
+
+  std::string outPathCopy = outInfo.c_str();
+  std::thread([fullCmd, outPathCopy, useVector]() {
+    std::string cmdOut;
+    int exitCode = winRunCommand(fullCmd, &cmdOut);
+    PdfImportResult* res = new PdfImportResult;
+    res->isVector = useVector;
+    res->outputPath = outPathCopy;
+    res->ok = (exitCode == 0);
+    if(!res->ok)
+      res->errorMsg = !cmdOut.empty() ? cmdOut : fstring("Exit code %d", exitCode);
+    SvgGui::pushUserEvent(scribbleSDLEvent, IMPORT_PDF_DONE, res);
+  }).detach();
+  return true;
+#else
+  messageBox(Warning, _("Import PDF"), _("PDF import is currently only implemented on Windows."));
+  return false;
+#endif
+}
 
 /// dialogs ///
 

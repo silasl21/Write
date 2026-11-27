@@ -26,7 +26,7 @@ public:
 
   std::string selectedFile;  // filename out
   std::string selectedSrcFile;  // source file when opening copy of file
-  enum Result_t {REJECTED = 0, NEW_DOC, EXISTING_DOC, OPEN_COPY, OPEN_WHITEBOARD, OPEN_HELP} result;  // out
+  enum Result_t {REJECTED = 0, NEW_DOC, EXISTING_DOC, OPEN_COPY, OPEN_WHITEBOARD, OPEN_HELP, IMPORT_PDF} result;  // out
   int selectedRuling;
 
   enum Mode_t {OPEN_DOC, CHOOSE_DOC, CHOOSE_IMAGE, SAVE_DOC, SAVE_PDF};
@@ -59,6 +59,7 @@ private:
   std::string fileExts;
   Button* newFolderBtn;
   Button* newDocBtn;
+  Button* importPdfBtn;
   Button* pasteButton;
   Button* undoButton;
   Button* helpBtn;

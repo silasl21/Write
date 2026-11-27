@@ -127,7 +127,17 @@ void setupResources()
       PLATFORM_LOG("Failed to load font %s\n", userFont.toString().c_str());
   }
 
+static const char* icons__ic_menu_invert_svg = R"~~~~(<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.2" baseProfile="tiny" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+  x="0px" y="0px" width="96px" height="96px" viewBox="0 0 24 24" xml:space="preserve">
+<g class="icon">
+  <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18V4c4.42 0 8 3.58 8 8s-3.58 8-8 8z"/>
+</g>
+</svg>
+)~~~~";
+
   loadIconRes();
+  addStringResources({{"icons/ic_menu_invert.svg", icons__ic_menu_invert_svg}});
   // hook to support loading from resources; can we move this somewhere to deduplicate w/ other projects?
   SvgParser::openStream = [](const char* name) -> std::istream* {
     if(name[0] == ':' && name[1] == '/')

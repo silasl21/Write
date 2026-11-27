@@ -1,6 +1,20 @@
 #include "winhelper.h"
 //#include "wintab/wmpointer.h" ... this was to support *compilation* on Win 7 and earlier
 #include "basics.h"
+#include "SDL_syswm.h"
+#include <commdlg.h>
+#include <setupapi.h>
+#include <cfgmgr32.h>
+#include <devpropdef.h>
+extern "C" {
+#include <hidsdi.h>
+#include <hidpi.h>
+}
+#include <array>
+#include <cmath>
+#include <deque>
+#include <map>
+#include <vector>
 
 
 #define USE_WINTAB 1
@@ -45,6 +59,10 @@ static bool winTabProximity = false;
 enum TouchPointState { TouchPointPressed = SDL_FINGERDOWN, TouchPointMoved = SDL_FINGERMOTION, TouchPointReleased = SDL_FINGERUP };
 enum PenEventType { TabletPress = SDL_FINGERDOWN, TabletMove = SDL_FINGERMOTION, TabletRelease = SDL_FINGERUP };
 
+static void stopHapticTexture();
+static void onPenHapticSeen();
+static void onPenHapticInput(PenEventType eventtype, Dim x, Dim y, double pressure, bool inContact, bool isEraser);
+
 struct TouchPoint
 {
   Point screenPos;
@@ -54,6 +72,7 @@ struct TouchPoint
 };
 
 static Rect clientRect;
+static double g_dpiScale = 1.0;
 
 static void updateClientRect(HWND hwnd)
 {
@@ -64,6 +83,13 @@ static void updateClientRect(HWND hwnd)
   ClientToScreen(hwnd, (LPPOINT)&rect);
   ClientToScreen(hwnd, (LPPOINT)&rect + 1);
   clientRect = Rect::ltrb(rect.left, rect.top, rect.right, rect.bottom);
+  HDC hdc = GetDC(hwnd);
+  if(hdc) {
+    int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+    if(dpi > 0)
+      g_dpiScale = dpi / 96.0;
+    ReleaseDC(hwnd, hdc);
+  }
 }
 
 static void notifyTabletEvent(PenEventType eventtype, const Point& globalpos,
@@ -211,6 +237,7 @@ static bool processWTPacket(MSG* msg)
 
     int uniqueId = 1;
     // TODO: enable and use pkTime field
+    onPenHapticInput(eventtype, globalx, globaly, pressure, (btnNew & tipBtn) != 0, eraser);
     notifyTabletEvent(eventtype, Point(globalx, globaly), pressure, 0, 0,
         eraser, btnNew ^ btnPrev, btnNew, uniqueId, SDL_GetTicks());
     btnPrev = btnNew;
@@ -226,6 +253,7 @@ static bool winTabEvent(MSG* msg) //, long* result)
     if(GET_WM_ACTIVATE_STATE(msg->wParam, msg->lParam))
       gpWTOverlap(hTab, TRUE);
     else {
+      stopHapticTexture();
       SDL_EventState(SDL_MOUSEMOTION, SDL_ENABLE);
       SDL_EventState(SDL_MOUSEBUTTONUP, SDL_ENABLE);
       SDL_EventState(SDL_MOUSEBUTTONDOWN, SDL_ENABLE);
@@ -262,8 +290,10 @@ static bool winTabEvent(MSG* msg) //, long* result)
       SDL_EventState(SDL_MOUSEBUTTONUP, SDL_DISABLE);
       SDL_EventState(SDL_MOUSEBUTTONDOWN, SDL_DISABLE);
       winTabProximity = true;
+      onPenHapticSeen();
     }
     else {  // leaving proximity
+      stopHapticTexture();
       SDL_EventState(SDL_MOUSEMOTION, SDL_ENABLE);
       SDL_EventState(SDL_MOUSEBUTTONUP, SDL_ENABLE);
       SDL_EventState(SDL_MOUSEBUTTONDOWN, SDL_ENABLE);
@@ -298,6 +328,675 @@ static bool winTabEvent(MSG* msg) //, long* result)
         clientRect.left, clientRect.top);
 */
 
+static constexpr USHORT SLIM_PEN_VID = 0x045E;
+static constexpr USHORT SLIM_PEN_PID = 0x0C0F;
+static constexpr BYTE WAVEFORM_LIST_REPORT_ID = 0x42;
+static constexpr BYTE TRIGGER_REPORT_ID = 0x41;
+static constexpr size_t TRIGGER_REPORT_LEN = 7;
+static constexpr BYTE FIRST_WAVEFORM_ORDINAL = 3;
+
+static constexpr UINT16 WF_NONE   = 0x1001;
+static constexpr UINT16 WF_STOP   = 0x1002;
+static constexpr UINT16 WF_CLICK  = 0x1003;
+static constexpr UINT16 WF_INK    = 0x100B;
+static constexpr UINT16 WF_PENCIL = 0x100C;
+static constexpr UINT16 WF_MARKER = 0x100D;
+static constexpr UINT16 WF_CHISEL = 0x100E;
+static constexpr UINT16 WF_BRUSH  = 0x100F;
+static constexpr UINT16 WF_ERASER = 0x1010;
+
+static const DEVPROPKEY kDevPropInstanceId = {
+  { 0x78c34fc8, 0x104a, 0x4aca, { 0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57 } }, 256
+};
+static const DEVPROPKEY kDevPropIsConnected = {
+  { 0x83da6326, 0x97a6, 0x4088, { 0x94, 0x53, 0xa1, 0x92, 0x3f, 0x57, 0x3b, 0x29 } }, 15
+};
+
+static bool g_syncInited = false;
+static CRITICAL_SECTION g_hapticCs;
+static HANDLE g_hapticWakeEvent = NULL;
+static HANDLE g_writerThread = NULL;
+static bool g_shutdownRequested = false;
+static bool g_connectRequested = false;
+
+static bool g_hasDevice = false;
+static bool g_lastWriteOk = true;
+static std::map<UINT16, BYTE> g_ordinals;
+static std::map<UINT16, UINT16> g_durations;
+static std::deque<std::array<BYTE, TRIGGER_REPORT_LEN>> g_oneShots;
+static bool g_hasPendingTexture = false;
+static std::array<BYTE, TRIGGER_REPORT_LEN> g_pendingTexture = {};
+
+static bool g_hapticsEnabled = true;
+static double g_hapticIntensity = 0.75;
+static WinPenHapticTool g_hapticTool = PEN_HAPTIC_INK;
+static bool g_penEraserActive = false;
+
+static bool g_penTipDown = false;
+static bool g_hasLastPos = false;
+static Dim g_lastLogicalX = 0;
+static Dim g_lastLogicalY = 0;
+static LONGLONG g_lastPosQpc = 0;
+static double g_qpcFreq = 0.0;
+static double g_travel = 0.0;
+static double g_speed = 0.0;
+
+static bool g_texturePlaying = false;
+static UINT16 g_textureWaveform = 0;
+static BYTE g_textureIntensity = 0;
+static ULONGLONG g_textureSentAtMs = 0;
+static ULONGLONG g_lastMoveTickMs = 0;
+
+static ULONGLONG g_penSeenAtMs = 0;
+static ULONGLONG g_wakeUntilMs = 0;
+static ULONGLONG g_wakeProbeAtMs = 0;
+static bool g_wakeProbed = false;
+static ULONGLONG g_firstWriteFailAtMs = 0;
+
+static void ensureHapticSyncInited()
+{
+  if(!g_syncInited) {
+    InitializeCriticalSection(&g_hapticCs);
+    LARGE_INTEGER freq;
+    if(QueryPerformanceFrequency(&freq) && freq.QuadPart > 0)
+      g_qpcFreq = double(freq.QuadPart);
+    g_syncInited = true;
+  }
+}
+
+static std::array<BYTE, TRIGGER_REPORT_LEN> buildTriggerReport(BYTE ordinal, BYTE intensity)
+{
+  std::array<BYTE, TRIGGER_REPORT_LEN> cmd = {};
+  cmd[0] = TRIGGER_REPORT_ID;
+  cmd[1] = 0x01;
+  cmd[2] = intensity < 1 ? 1 : intensity;
+  cmd[3] = ordinal;
+  return cmd;
+}
+
+static bool parseWaveformTable(const BYTE* buf, size_t len,
+    std::map<UINT16, BYTE>& ordinals, std::map<UINT16, UINT16>& durations)
+{
+  const size_t tableStart = 5;
+  if(!buf || len < tableStart + 4)
+    return false;
+  size_t slots = (len - tableStart) / 4;
+  if(slots < 1)
+    return false;
+
+  ordinals.clear();
+  durations.clear();
+  ordinals[WF_NONE] = 1;
+  ordinals[WF_STOP] = 2;
+
+  for(size_t i = 0; i < slots; ++i) {
+    UINT16 duration = UINT16(buf[tableStart + i * 2] | (buf[tableStart + i * 2 + 1] << 8));
+    size_t wfOff = tableStart + (slots + i) * 2;
+    UINT16 wfId = UINT16(buf[wfOff] | (buf[wfOff + 1] << 8));
+    if(wfId < WF_CLICK)
+      continue;
+    ordinals[wfId] = BYTE(FIRST_WAVEFORM_ORDINAL + i);
+    durations[wfId] = duration;
+  }
+  return ordinals.count(WF_CLICK) > 0;
+}
+
+static std::wstring findBluetoothDevice(const std::wstring& hidPath)
+{
+  DEVPROPTYPE propType = 0;
+  ULONG size = 0;
+  CM_Get_Device_Interface_PropertyW(hidPath.c_str(), &kDevPropInstanceId, &propType, NULL, &size, 0);
+  if(size < sizeof(WCHAR))
+    return std::wstring();
+
+  std::vector<BYTE> buf(size);
+  if(CM_Get_Device_Interface_PropertyW(hidPath.c_str(), &kDevPropInstanceId, &propType, buf.data(), &size, 0) != CR_SUCCESS)
+    return std::wstring();
+
+  const WCHAR* idPtr = reinterpret_cast<const WCHAR*>(buf.data());
+  size_t maxChars = size / sizeof(WCHAR);
+  std::wstring instId(idPtr, wcsnlen(idPtr, maxChars));
+
+  DEVINST node = 0;
+  if(CM_Locate_DevNodeW(&node, const_cast<DEVINSTID_W>(instId.c_str()), 0) != CR_SUCCESS)
+    return std::wstring();
+
+  WCHAR name[512];
+  for(int depth = 0; depth < 10; ++depth) {
+    if(CM_Get_Device_IDW(node, name, 512, 0) != CR_SUCCESS)
+      return std::wstring();
+    name[511] = L'\0';
+    if(_wcsnicmp(name, L"BTHLE\\DEV_", 10) == 0)
+      return std::wstring(name);
+    DEVINST parent = 0;
+    if(CM_Get_Parent(&parent, node, 0) != CR_SUCCESS)
+      return std::wstring();
+    node = parent;
+  }
+  return std::wstring();
+}
+
+static int isBluetoothConnected(const std::wstring& btId)
+{
+  if(btId.empty())
+    return -1;
+  DEVINST node = 0;
+  if(CM_Locate_DevNodeW(&node, const_cast<DEVINSTID_W>(btId.c_str()), 0) != CR_SUCCESS)
+    return -1;
+  DEVPROPTYPE propType = 0;
+  BYTE val[4] = {};
+  ULONG size = sizeof(val);
+  if(CM_Get_DevNode_PropertyW(node, &kDevPropIsConnected, &propType, val, &size, 0) != CR_SUCCESS || size == 0)
+    return -1;
+  return val[0] != 0 ? 1 : 0;
+}
+
+struct HidWriterState {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  std::wstring devicePath;
+  std::wstring btDeviceId;
+};
+
+static bool tryWriteHid(HidWriterState& st, const BYTE* cmd, DWORD len)
+{
+  for(int attempt = 0; attempt < 2; ++attempt) {
+    if(st.handle == INVALID_HANDLE_VALUE) {
+      if(st.devicePath.empty())
+        return false;
+      st.handle = CreateFileW(st.devicePath.c_str(),
+          GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+          NULL, OPEN_EXISTING, 0, NULL);
+      if(st.handle == INVALID_HANDLE_VALUE)
+        return false;
+    }
+
+    DWORD written = 0;
+    if(WriteFile(st.handle, cmd, len, &written, NULL) && written == len)
+      return true;
+
+    CloseHandle(st.handle);
+    st.handle = INVALID_HANDLE_VALUE;
+  }
+  return false;
+}
+
+static bool connectHid(HidWriterState& st)
+{
+  if(st.handle != INVALID_HANDLE_VALUE) {
+    CloseHandle(st.handle);
+    st.handle = INVALID_HANDLE_VALUE;
+  }
+
+  GUID hidGuid;
+  HidD_GetHidGuid(&hidGuid);
+  HDEVINFO devInfo = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+  if(devInfo == INVALID_HANDLE_VALUE)
+    return false;
+
+  bool found = false;
+  SP_DEVICE_INTERFACE_DATA ifData = {};
+  ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+  for(DWORD i = 0; SetupDiEnumDeviceInterfaces(devInfo, NULL, &hidGuid, i, &ifData); ++i) {
+    DWORD needed = 0;
+    SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, NULL, 0, &needed, NULL);
+    if(needed < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
+      continue;
+
+    std::vector<BYTE> detailBuf(needed);
+    PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail =
+        reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(detailBuf.data());
+    detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+    if(!SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, detail, needed, NULL, NULL))
+      continue;
+
+    std::wstring path(detail->DevicePath);
+    HANDLE h = CreateFileW(path.c_str(),
+        GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING, 0, NULL);
+    if(h == INVALID_HANDLE_VALUE)
+      continue;
+
+    HIDD_ATTRIBUTES attrs = {};
+    attrs.Size = sizeof(HIDD_ATTRIBUTES);
+    if(!HidD_GetAttributes(h, &attrs) ||
+        attrs.VendorID != SLIM_PEN_VID || attrs.ProductID != SLIM_PEN_PID) {
+      CloseHandle(h);
+      continue;
+    }
+
+    PHIDP_PREPARSED_DATA ppd = NULL;
+    if(!HidD_GetPreparsedData(h, &ppd)) {
+      CloseHandle(h);
+      continue;
+    }
+    HIDP_CAPS caps = {};
+    NTSTATUS capsOk = HidP_GetCaps(ppd, &caps);
+    HidD_FreePreparsedData(ppd);
+
+    if(capsOk != HIDP_STATUS_SUCCESS ||
+        caps.UsagePage != HID_USAGE_PAGE_DIGITIZER ||
+        caps.OutputReportByteLength != TRIGGER_REPORT_LEN ||
+        caps.FeatureReportByteLength < 9) {
+      CloseHandle(h);
+      continue;
+    }
+
+    std::wstring btId = findBluetoothDevice(path);
+    if(isBluetoothConnected(btId) == 0) {
+      CloseHandle(h);
+      continue;
+    }
+
+    std::vector<BYTE> feat(caps.FeatureReportByteLength, 0);
+    feat[0] = WAVEFORM_LIST_REPORT_ID;
+    std::map<UINT16, BYTE> ordinals;
+    std::map<UINT16, UINT16> durations;
+    if(!HidD_GetFeature(h, feat.data(), ULONG(feat.size())) ||
+        !parseWaveformTable(feat.data(), feat.size(), ordinals, durations)) {
+      CloseHandle(h);
+      continue;
+    }
+
+    st.handle = h;
+    st.devicePath = path;
+    st.btDeviceId = btId;
+
+    EnterCriticalSection(&g_hapticCs);
+    g_ordinals.swap(ordinals);
+    g_durations.swap(durations);
+    g_hasDevice = true;
+    g_lastWriteOk = true;
+    g_firstWriteFailAtMs = 0;
+    LeaveCriticalSection(&g_hapticCs);
+
+    found = true;
+    break;
+  }
+
+  SetupDiDestroyDeviceInfoList(devInfo);
+  return found;
+}
+
+static DWORD WINAPI hapticWriterThread(LPVOID)
+{
+  HidWriterState st;
+  for(;;) {
+    bool shuttingDown = false;
+    bool needConnect = false;
+    bool hasCmd = false;
+    std::array<BYTE, TRIGGER_REPORT_LEN> cmd = {};
+    DWORD waitMs = INFINITE;
+
+    EnterCriticalSection(&g_hapticCs);
+    shuttingDown = g_shutdownRequested;
+    if(!shuttingDown) {
+      if(g_texturePlaying && (GetTickCount64() - g_lastMoveTickMs > 120)) {
+        g_texturePlaying = false;
+        g_textureWaveform = 0;
+        g_hasPendingTexture = false;
+        g_oneShots.push_back(buildTriggerReport(2 /* WF_STOP */, 100));
+      }
+      if(g_connectRequested) {
+        needConnect = true;
+        g_connectRequested = false;
+      }
+      else if(!g_oneShots.empty()) {
+        cmd = g_oneShots.front();
+        g_oneShots.pop_front();
+        hasCmd = true;
+      }
+      else if(g_hasPendingTexture) {
+        cmd = g_pendingTexture;
+        g_hasPendingTexture = false;
+        hasCmd = true;
+      }
+      waitMs = g_texturePlaying ? 80 : INFINITE;
+    }
+    LeaveCriticalSection(&g_hapticCs);
+
+    if(shuttingDown)
+      break;
+    if(needConnect) {
+      connectHid(st);
+      continue;
+    }
+    if(hasCmd) {
+      bool ok = tryWriteHid(st, cmd.data(), DWORD(cmd.size()));
+      EnterCriticalSection(&g_hapticCs);
+      g_lastWriteOk = ok;
+      if(ok)
+        g_firstWriteFailAtMs = 0;
+      else if(g_firstWriteFailAtMs == 0)
+        g_firstWriteFailAtMs = GetTickCount64();
+      LeaveCriticalSection(&g_hapticCs);
+      continue;
+    }
+    WaitForSingleObject(g_hapticWakeEvent, waitMs);
+  }
+
+  if(st.handle != INVALID_HANDLE_VALUE) {
+    CloseHandle(st.handle);
+    st.handle = INVALID_HANDLE_VALUE;
+  }
+  return 0;
+}
+
+static void initPenHaptics()
+{
+  ensureHapticSyncInited();
+  if(g_writerThread)
+    return;
+  if(!g_hapticWakeEvent)
+    g_hapticWakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+  EnterCriticalSection(&g_hapticCs);
+  g_shutdownRequested = false;
+  g_connectRequested = true;
+  LeaveCriticalSection(&g_hapticCs);
+  g_writerThread = CreateThread(NULL, 0, hapticWriterThread, NULL, 0, NULL);
+}
+
+static void shutdownPenHaptics()
+{
+  if(!g_syncInited)
+    return;
+  if(g_writerThread) {
+    EnterCriticalSection(&g_hapticCs);
+    g_shutdownRequested = true;
+    g_oneShots.clear();
+    g_hasPendingTexture = false;
+    g_texturePlaying = false;
+    LeaveCriticalSection(&g_hapticCs);
+    if(g_hapticWakeEvent)
+      SetEvent(g_hapticWakeEvent);
+    WaitForSingleObject(g_writerThread, 1500);
+    CloseHandle(g_writerThread);
+    g_writerThread = NULL;
+  }
+  if(g_hapticWakeEvent) {
+    CloseHandle(g_hapticWakeEvent);
+    g_hapticWakeEvent = NULL;
+  }
+}
+
+static void stopHapticTexture()
+{
+  ensureHapticSyncInited();
+  if(!g_writerThread)
+    return;
+  bool wake = false;
+  EnterCriticalSection(&g_hapticCs);
+  if(g_texturePlaying || g_hasPendingTexture) {
+    g_texturePlaying = false;
+    g_textureWaveform = 0;
+    g_hasPendingTexture = false;
+    g_oneShots.push_back(buildTriggerReport(2 /* WF_STOP */, 100));
+    wake = true;
+  }
+  LeaveCriticalSection(&g_hapticCs);
+  if(wake && g_hapticWakeEvent)
+    SetEvent(g_hapticWakeEvent);
+}
+
+static BYTE lookupBestOrdinalLocked(UINT16 primary, UINT16 secondary, UINT16 tertiary, UINT16* chosenWf)
+{
+  if(primary) {
+    auto it = g_ordinals.find(primary);
+    if(it != g_ordinals.end()) {
+      if(chosenWf) *chosenWf = primary;
+      return it->second;
+    }
+  }
+  if(secondary) {
+    auto it = g_ordinals.find(secondary);
+    if(it != g_ordinals.end()) {
+      if(chosenWf) *chosenWf = secondary;
+      return it->second;
+    }
+  }
+  if(tertiary) {
+    auto it = g_ordinals.find(tertiary);
+    if(it != g_ordinals.end()) {
+      if(chosenWf) *chosenWf = tertiary;
+      return it->second;
+    }
+  }
+  return 0;
+}
+
+static void resolveToolWaveforms(UINT16& primary, UINT16& secondary, UINT16& tertiary)
+{
+  primary = 0;
+  secondary = 0;
+  tertiary = 0;
+  if(g_penEraserActive) {
+    primary = WF_ERASER;
+    secondary = WF_INK;
+    return;
+  }
+  switch(g_hapticTool) {
+  case PEN_HAPTIC_NONE:   break;
+  case PEN_HAPTIC_INK:    primary = WF_INK; break;
+  case PEN_HAPTIC_PENCIL: primary = WF_PENCIL; secondary = WF_INK; break;
+  case PEN_HAPTIC_MARKER: primary = WF_MARKER; secondary = WF_INK; break;
+  case PEN_HAPTIC_BRUSH:  primary = WF_BRUSH; secondary = WF_INK; break;
+  case PEN_HAPTIC_CHISEL: primary = WF_CHISEL; secondary = WF_MARKER; tertiary = WF_INK; break;
+  case PEN_HAPTIC_ERASER: primary = WF_ERASER; secondary = WF_INK; break;
+  }
+}
+
+static void onPenHapticSeen()
+{
+  ensureHapticSyncInited();
+  if(!g_hapticsEnabled || !g_writerThread)
+    return;
+
+  ULONGLONG now = GetTickCount64();
+  bool woke = (g_penSeenAtMs == 0) || (now - g_penSeenAtMs > 2000);
+  g_penSeenAtMs = now;
+  if(woke) {
+    g_wakeUntilMs = now + 8000;
+    g_wakeProbed = false;
+    g_wakeProbeAtMs = now >= 400 ? now - 400 : 0;
+  }
+
+  if(now >= g_wakeUntilMs || (now - g_wakeProbeAtMs < 400))
+    return;
+
+  bool wake = false;
+  EnterCriticalSection(&g_hapticCs);
+  if(g_wakeProbed && g_hasDevice && g_lastWriteOk) {
+    g_wakeUntilMs = 0;
+    LeaveCriticalSection(&g_hapticCs);
+    return;
+  }
+  g_wakeProbeAtMs = now;
+  g_wakeProbed = true;
+  if(!g_hasDevice || (g_firstWriteFailAtMs && (now - g_firstWriteFailAtMs > 3000))) {
+    g_connectRequested = true;
+    g_firstWriteFailAtMs = 0;
+    wake = true;
+  }
+  else if(!g_lastWriteOk || g_oneShots.empty()) {
+    g_oneShots.push_back(buildTriggerReport(2 /* WF_STOP */, 100));
+    wake = true;
+  }
+  LeaveCriticalSection(&g_hapticCs);
+  if(wake && g_hapticWakeEvent)
+    SetEvent(g_hapticWakeEvent);
+}
+
+static void onPenHapticInput(PenEventType eventtype, Dim x, Dim y, double pressure, bool inContact, bool isEraser)
+{
+  onPenHapticSeen();
+  g_penEraserActive = isEraser;
+
+  if(eventtype == TabletPress) {
+    stopHapticTexture();
+    g_penTipDown = true;
+    g_hasLastPos = false;
+    g_travel = 0.0;
+    g_speed = 0.0;
+    return;
+  }
+  if(eventtype == TabletRelease) {
+    g_penTipDown = false;
+    g_hasLastPos = false;
+    stopHapticTexture();
+    return;
+  }
+
+  if(!inContact || !g_penTipDown) {
+    if(g_penTipDown) {
+      g_penTipDown = false;
+      g_hasLastPos = false;
+    }
+    stopHapticTexture();
+    return;
+  }
+  if(!g_hapticsEnabled || g_hapticIntensity <= 0.0 || !g_writerThread) {
+    stopHapticTexture();
+    return;
+  }
+
+  UINT16 primary = 0, secondary = 0, tertiary = 0;
+  resolveToolWaveforms(primary, secondary, tertiary);
+  if(!primary) {
+    stopHapticTexture();
+    return;
+  }
+
+  double scale = g_dpiScale > 0.0 ? g_dpiScale : 1.0;
+  Dim lx = x / scale;
+  Dim ly = y / scale;
+  LARGE_INTEGER qpcNow;
+  QueryPerformanceCounter(&qpcNow);
+
+  if(!g_hasLastPos) {
+    g_hasLastPos = true;
+    g_lastLogicalX = lx;
+    g_lastLogicalY = ly;
+    g_lastPosQpc = qpcNow.QuadPart;
+    return;
+  }
+
+  double dt = g_qpcFreq > 0.0 ? double(qpcNow.QuadPart - g_lastPosQpc) / g_qpcFreq : 0.016;
+  if(dt < 0.004)
+    return;
+
+  double dx = double(lx - g_lastLogicalX);
+  double dy = double(ly - g_lastLogicalY);
+  double dist = std::sqrt(dx * dx + dy * dy);
+  g_lastLogicalX = lx;
+  g_lastLogicalY = ly;
+  g_lastPosQpc = qpcNow.QuadPart;
+  g_travel += dist;
+  g_speed += 0.3 * (dist / dt - g_speed);
+
+  if(g_travel < 6.0 || g_speed < 20.0) {
+    stopHapticTexture();
+    return;
+  }
+
+  bool alreadyPlaying = false;
+  EnterCriticalSection(&g_hapticCs);
+  alreadyPlaying = g_texturePlaying;
+  LeaveCriticalSection(&g_hapticCs);
+  if(!alreadyPlaying && g_speed < 40.0)
+    return;
+
+  double sp = g_speed / 800.0;
+  if(sp < 0.0) sp = 0.0;
+  if(sp > 1.0) sp = 1.0;
+  double pr = pressure;
+  if(pr < 0.0) pr = 0.0;
+  if(pr > 1.0) pr = 1.0;
+
+  double speedPart = std::sqrt(sp);
+  double pressurePart = 0.5 + 0.5 * pr;
+  double level = 0.5 + 0.5 * speedPart * pressurePart;
+  int rawTarget = int(std::lround(255.0 * g_hapticIntensity * level));
+  if(rawTarget < 1) rawTarget = 1;
+  if(rawTarget > 255) rawTarget = 255;
+  BYTE target = BYTE(rawTarget);
+
+  ULONGLONG nowMs = GetTickCount64();
+  bool wake = false;
+  EnterCriticalSection(&g_hapticCs);
+  UINT16 chosenWf = 0;
+  BYTE ordinal = lookupBestOrdinalLocked(primary, secondary, tertiary, &chosenWf);
+  if(ordinal != 0) {
+    g_lastMoveTickMs = nowMs;
+    UINT16 dur = 0;
+    auto dit = g_durations.find(chosenWf);
+    if(dit != g_durations.end())
+      dur = dit->second;
+    ULONGLONG keepAlive = dur > 0 ? ULONGLONG(dur * 3 / 4) : 1000;
+    ULONGLONG elapsed = nowMs - g_textureSentAtMs;
+    bool changed = (std::abs(int(target) - int(g_textureIntensity)) >= 20) && (elapsed >= 100);
+    bool retry = !g_lastWriteOk && (elapsed >= 150);
+
+    if(!g_texturePlaying || chosenWf != g_textureWaveform || changed || retry || elapsed >= keepAlive) {
+      g_pendingTexture = buildTriggerReport(ordinal, target);
+      g_hasPendingTexture = true;
+      g_texturePlaying = true;
+      g_textureWaveform = chosenWf;
+      g_textureIntensity = target;
+      g_textureSentAtMs = nowMs;
+      wake = true;
+    }
+  }
+  LeaveCriticalSection(&g_hapticCs);
+  if(wake && g_hapticWakeEvent)
+    SetEvent(g_hapticWakeEvent);
+}
+
+void winSetPenHapticsConfig(bool enabled, double intensity01)
+{
+  if(intensity01 < 0.0) intensity01 = 0.0;
+  if(intensity01 > 1.0) intensity01 = 1.0;
+  if(g_hapticsEnabled == enabled && g_hapticIntensity == intensity01)
+    return;
+  g_hapticsEnabled = enabled;
+  g_hapticIntensity = intensity01;
+  if(!enabled || intensity01 <= 0.0)
+    stopHapticTexture();
+}
+
+void winSetPenHapticsTool(WinPenHapticTool tool)
+{
+  if(g_hapticTool == tool)
+    return;
+  g_hapticTool = tool;
+  if(tool == PEN_HAPTIC_NONE)
+    stopHapticTexture();
+}
+
+void winTriggerPenHapticClick()
+{
+  ensureHapticSyncInited();
+  if(!g_hapticsEnabled || g_hapticIntensity <= 0.0 || !g_writerThread)
+    return;
+
+  int rawTarget = int(std::lround(255.0 * g_hapticIntensity));
+  if(rawTarget < 1) rawTarget = 1;
+  if(rawTarget > 255) rawTarget = 255;
+  BYTE target = BYTE(rawTarget);
+
+  bool wake = false;
+  EnterCriticalSection(&g_hapticCs);
+  auto it = g_ordinals.find(WF_CLICK);
+  if(it != g_ordinals.end()) {
+    g_hasPendingTexture = false;
+    g_texturePlaying = false;
+    g_textureWaveform = 0;
+    g_oneShots.push_back(buildTriggerReport(it->second, target));
+    wake = true;
+  }
+  LeaveCriticalSection(&g_hapticCs);
+  if(wake && g_hapticWakeEvent)
+    SetEvent(g_hapticWakeEvent);
+}
+
 static void processPenInfo(const POINTER_PEN_INFO& ppi, PenEventType eventtype)
 {
   static UINT32 prevButtons = 0;
@@ -320,6 +1019,8 @@ static void processPenInfo(const POINTER_PEN_INFO& ppi, PenEventType eventtype)
   // if barrel button pressed when pen down, penFlags changes but pointerFlags doesn't (the first time)
   UINT32 buttons = ((ppi.pointerInfo.pointerFlags >> 4) & 0x1F) | (ppi.penFlags & PEN_FLAG_BARREL ? SDL_BUTTON_RMASK : 0);
   bool isEraser = ppi.penFlags & (PEN_FLAG_ERASER | PEN_FLAG_INVERTED);  // PEN_FLAG_INVERTED means eraser in proximity
+  bool inContact = (ppi.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT) != 0;
+  onPenHapticInput(eventtype, x, y, ppi.pressure/1024.0, inContact, isEraser);
   notifyTabletEvent(eventtype, Point(x, y), ppi.pressure/1024.0, ppi.tiltX/90.0, ppi.tiltY/90.0, isEraser,
       buttons ^ prevButtons, buttons, int(ppi.pointerInfo.sourceDevice), ppi.pointerInfo.dwTime);
   prevButtons = buttons;
@@ -421,6 +1122,27 @@ static bool winInputEvent(MSG* m) //, long* result)
   // WM_POINTER:
   // WM_POINTERDOWN with type PT_PEN: ignore all other pointers, use GetPointerPenInfoHistory
   // otherwise, use GetPointerFrameInfo (discard history)
+  case WM_POINTERENTER:
+  {
+    UINT32 ptrId = GET_POINTERID_WPARAM(m->wParam);
+    if(GetPointerInfo(ptrId, &pointerInfo[0]) && pointerInfo[0].pointerType == PT_PEN) {
+      if(GetPointerPenInfo(ptrId, &penPointerInfo[0]))
+        g_penEraserActive = (penPointerInfo[0].penFlags & (PEN_FLAG_ERASER | PEN_FLAG_INVERTED)) != 0;
+      onPenHapticSeen();
+    }
+    break;  // let DefWindowProc / SDL handle hover cursor
+  }
+  case WM_POINTERLEAVE:
+  case WM_POINTERCAPTURECHANGED:
+    stopHapticTexture();
+    break;
+  case WM_ACTIVATE:
+    if(LOWORD(m->wParam) == WA_INACTIVE)
+      stopHapticTexture();
+    break;
+  case WM_DESTROY:
+    shutdownPenHaptics();
+    break;
   case WM_POINTERDOWN:
     updateClientRect(m->hwnd);
     if(GetPointerInfo(GET_POINTERID_WPARAM(m->wParam), &pointerInfo[0])) {
@@ -531,6 +1253,7 @@ void initTouchInput(SDL_Window* sdlwin, bool useWintab)
 
   // setup Wintab and WM_POINTER support
   initWMPointer();
+  initPenHaptics();
 #ifdef USE_WINTAB
   hTab = NULL;
   if(useWintab)
@@ -624,6 +1347,98 @@ Image getClipboardImage()
   }
   CloseClipboard();
   return img;
+}
+
+std::string winOpenPdfDialog(SDL_Window* sdlwin, const char* initialDir)
+{
+  HWND hwnd = NULL;
+  if(sdlwin) {
+    SDL_SysWMinfo wmInfo;
+    SDL_VERSION(&wmInfo.version);
+    if(SDL_GetWindowWMInfo(sdlwin, &wmInfo))
+      hwnd = wmInfo.info.win.window;
+  }
+
+  wchar_t fileBuf[4096] = {};
+  std::wstring initDirW;
+  if(initialDir && initialDir[0]) {
+    initDirW = utf8_to_wstr(initialDir);
+    for(wchar_t& ch : initDirW) {
+      if(ch == L'/') ch = L'\\';
+    }
+  }
+
+  OPENFILENAMEW ofn = {};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = hwnd;
+  ofn.lpstrFilter = L"PDF Files (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0";
+  ofn.lpstrFile = fileBuf;
+  ofn.nMaxFile = sizeof(fileBuf) / sizeof(fileBuf[0]);
+  ofn.lpstrInitialDir = initDirW.empty() ? NULL : initDirW.c_str();
+  ofn.lpstrTitle = L"Import PDF";
+  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+  if(GetOpenFileNameW(&ofn))
+    return wstr_to_utf8(fileBuf);
+  return "";
+}
+
+int winRunCommand(const std::string& cmdLine, std::string* output)
+{
+  if(output)
+    output->clear();
+
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, cmdLine.c_str(), -1, NULL, 0);
+  if(wlen <= 0) {
+    if(output) *output = "Invalid UTF-8 command line";
+    return -1;
+  }
+  std::vector<wchar_t> cmdBuf(wlen);
+  MultiByteToWideChar(CP_UTF8, 0, cmdLine.c_str(), -1, cmdBuf.data(), wlen);
+
+  SECURITY_ATTRIBUTES sa = {};
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+
+  HANDLE hRead = NULL, hWrite = NULL;
+  if(!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+    if(output) *output = "CreatePipe failed";
+    return -1;
+  }
+  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+  STARTUPINFOW si = {};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = hWrite;
+  si.hStdError = hWrite;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+  PROCESS_INFORMATION pi = {};
+  BOOL ok = CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  CloseHandle(hWrite);
+
+  if(!ok) {
+    DWORD err = GetLastError();
+    CloseHandle(hRead);
+    if(output) *output = fstring("Failed to launch command (error %lu)", (unsigned long)err);
+    return -1;
+  }
+
+  char buf[4096];
+  DWORD bytesRead = 0;
+  while(ReadFile(hRead, buf, sizeof(buf), &bytesRead, NULL) && bytesRead > 0) {
+    if(output)
+      output->append(buf, bytesRead);
+  }
+  CloseHandle(hRead);
+
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD exitCode = 1;
+  GetExitCodeProcess(pi.hProcess, &exitCode);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  return int(exitCode);
 }
 
 // On Win 8.1 VM, widthMM is just 96 * widthPx

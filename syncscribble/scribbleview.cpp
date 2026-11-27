@@ -595,13 +595,23 @@ void ScribbleView::doPaintEvent(Painter* painter, const Rect& dirty)
   painter->save();
   painter->translate(xorigin + panxoffset, yorigin + panyoffset);
   painter->scale(mScale, mScale);
-  if(cfg->Bool("invertColors"))
-    painter->setColorXorMask(color_t(cfg->Int("colorXorMask")));
+  if(cfg->Bool("invertColors")) {
+    color_t mask = color_t(cfg->Int("colorXorMask"));
+    if(mask != 0x00FFFFFF)
+      painter->setColorXorMask(mask);
+    else
+      painter->setColorInvertMode(1);
+  }
   drawImage(painter, screenToDim(dirtyRectScreen));
   painter->restore();
 
-  if(cfg->Bool("invertColors"))
-    painter->setColorXorMask(color_t(cfg->Int("colorXorMask")));
+  if(cfg->Bool("invertColors")) {
+    color_t mask = color_t(cfg->Int("colorXorMask"));
+    if(mask != 0x00FFFFFF)
+      painter->setColorXorMask(mask);
+    else
+      painter->setColorInvertMode(1);
+  }
   drawScreen(painter, dirtyRectScreen);
   //painter->endFrame();
   dirtyRectScreen = Rect();

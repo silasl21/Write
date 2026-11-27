@@ -96,6 +96,7 @@ public:
   Action* actionLasso_Select;
   Action* actionPath_Select;
   Action* actionExport_PDF;
+  Action* actionImport_PDF;
   Action* actionPreferences;
   Action* actionCreate_Link;
   Action* actionUngroup;
