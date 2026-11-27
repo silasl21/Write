@@ -51,15 +51,21 @@ public:
 
 protected:
   struct SnappedShape {
-    enum Type { None, Circle, Rectangle, Arrow, Line } type = None;
+    enum Type { None, Circle, Ellipse, Rectangle, Triangle, Arrow, CurvedArrow, Arc, Line } type = None;
     Point p1;
     Point p2;
     double radius = 0;
+    double rx = 0, ry = 0, angle = 0;
+    double bulge = 0;
     Point origP1;
     Point origP2;
     double origRadius = 0;
+    double origRx = 0, origRy = 0;
     Point rectFixedCorner;
     Point rectDragCorner;
+    Point tri[3];
+    Point origTri[3];
+    int triDragIdx = 0;
   };
 
   bool checkHoldReady(Timestamp now);

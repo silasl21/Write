@@ -9,7 +9,7 @@ Cross-platform (Windows, Mac, Linux, iOS, Android) application for handwritten n
 
 ## Additions in This Fork ##
 
-* **Hold-to-Shape with Drag-Resize:** Hold the pen at the end of a stroke to snap lines/rectangles/ellipses, then keep dragging before lifting to resize; includes improved rectangle detection.
+* **Hold-to-Shape with Drag-Resize:** Hold the pen at the end of a stroke to snap lines (with 0°/45°/90° angle snapping), circles, ellipses, rectangles, triangles, arrows, curved arcs, or curved arrows, then keep dragging before lifting to resize/adjust.
 * **Direct PDF Import:** Built-in PDF import dialog with **Light** (raster) and **Vector (Background)** modes plus custom `.svgz` naming. Portable `pdf2lightwrite.cmd` / `pdf2write.cmd` scripts (under `syncscribble/windows/tools/`, bundled in the release zip) are resolved from Write's folder, `C:\Tools\`, or `PATH` — requiring only Poppler (`winget install oschwartz10612.Poppler`, no Git Bash needed).
 * **Surface Slim Pen 2 Haptics (Windows):** Direct Bluetooth LE HID haptic feedback supporting per-tool/eraser drag textures, adjustable intensity in Preferences → Input, and a tactile click pulse on hold-to-shape snap.
 * **Hue-Preserving Soft Dark Page Mode:** Quick toolbar toggle button that renders white pages as soft charcoal (`#1E1E1E`) and dark workspace (`#121212`), inverts raster images/PDF pages cleanly, and preserves ink hues without altering saved `.svgz` files.

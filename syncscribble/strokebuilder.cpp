@@ -75,8 +75,10 @@ bool StrokeBuilder::detectSnappedShape(Timestamp now)
 
   Point centroid;
   double avgRadius = 0;
+  double rx = 0, ry = 0, angle = 0, bulge = 0;
   Point start, end;
   std::vector<Point> corners;
+  Point triVerts[3];
 
   if(ShapeRecognizer::isRectangle(rawPoints, corners)) {
     double avgLeftX   = (corners[0].x + corners[3].x) * 0.5;
@@ -93,12 +95,34 @@ bool StrokeBuilder::detectSnappedShape(Timestamp now)
     snappedShape.rectFixedCorner = Point(rightSide ? avgLeftX : avgRightX, bottomSide ? avgTopY : avgBottomY);
     snappedShape.rectDragCorner = Point(rightSide ? avgRightX : avgLeftX, bottomSide ? avgBottomY : avgTopY);
   }
+  else if(ShapeRecognizer::isTriangle(rawPoints, triVerts)) {
+    snappedShape.type = SnappedShape::Triangle;
+    int closest = 0;
+    double bestDist = holdAnchor.dist(triVerts[0]);
+    for(int i = 0; i < 3; ++i) {
+      snappedShape.tri[i] = snappedShape.origTri[i] = triVerts[i];
+      double d = holdAnchor.dist(triVerts[i]);
+      if(d < bestDist) {
+        bestDist = d;
+        closest = i;
+      }
+    }
+    snappedShape.triDragIdx = closest;
+  }
   else if(ShapeRecognizer::isCircle(rawPoints, centroid, avgRadius)) {
     snappedShape.type = SnappedShape::Circle;
     snappedShape.p1 = snappedShape.origP1 = centroid;
     snappedShape.radius = snappedShape.origRadius = avgRadius;
   }
+  else if(ShapeRecognizer::isEllipse(rawPoints, centroid, rx, ry, angle)) {
+    snappedShape.type = SnappedShape::Ellipse;
+    snappedShape.p1 = snappedShape.origP1 = centroid;
+    snappedShape.rx = snappedShape.origRx = rx;
+    snappedShape.ry = snappedShape.origRy = ry;
+    snappedShape.angle = angle;
+  }
   else if(ShapeRecognizer::isArrow(rawPoints, start, end)) {
+    end = ShapeRecognizer::snapLineAngle(start, end);
     if(start.dist(end) <= 1e-6)
       return false;
     snappedShape.type = SnappedShape::Arrow;
@@ -106,11 +130,28 @@ bool StrokeBuilder::detectSnappedShape(Timestamp now)
     snappedShape.p2 = snappedShape.origP2 = end;
   }
   else if(ShapeRecognizer::isLine(rawPoints, start, end)) {
+    end = ShapeRecognizer::snapLineAngle(start, end);
     if(start.dist(end) <= 1e-6)
       return false;
     snappedShape.type = SnappedShape::Line;
     snappedShape.p1 = snappedShape.origP1 = start;
     snappedShape.p2 = snappedShape.origP2 = end;
+  }
+  else if(ShapeRecognizer::isCurvedArrow(rawPoints, start, end, bulge)) {
+    if(start.dist(end) <= 1e-6)
+      return false;
+    snappedShape.type = SnappedShape::CurvedArrow;
+    snappedShape.p1 = snappedShape.origP1 = start;
+    snappedShape.p2 = snappedShape.origP2 = end;
+    snappedShape.bulge = bulge;
+  }
+  else if(ShapeRecognizer::isArc(rawPoints, start, end, bulge)) {
+    if(start.dist(end) <= 1e-6)
+      return false;
+    snappedShape.type = SnappedShape::Arc;
+    snappedShape.p1 = snappedShape.origP1 = start;
+    snappedShape.p2 = snappedShape.origP2 = end;
+    snappedShape.bulge = bulge;
   }
   else {
     return false;
@@ -139,6 +180,14 @@ bool StrokeBuilder::updateSnappedShapeFromPoint(Point p)
     snappedShape.radius = std::max(4.0, snappedShape.origRadius + (d1 - d0));
     return true;
   }
+  case SnappedShape::Ellipse: {
+    double d0 = std::max(10.0, snapPos.dist(snappedShape.origP1));
+    double d1 = p.dist(snappedShape.origP1);
+    double scale = std::max(0.15, d1 / d0);
+    snappedShape.rx = std::max(4.0, snappedShape.origRx * scale);
+    snappedShape.ry = std::max(4.0, snappedShape.origRy * scale);
+    return true;
+  }
   case SnappedShape::Rectangle: {
     Point fixed = snappedShape.rectFixedCorner;
     Point cur(snappedShape.rectDragCorner.x + (p.x - snapPos.x),
@@ -151,11 +200,33 @@ bool StrokeBuilder::updateSnappedShapeFromPoint(Point p)
     snappedShape.p2 = Point(std::max(fixed.x, cur.x), std::max(fixed.y, cur.y));
     return true;
   }
+  case SnappedShape::Triangle: {
+    int idx = snappedShape.triDragIdx;
+    Point nextV(snappedShape.origTri[idx].x + (p.x - snapPos.x),
+                snappedShape.origTri[idx].y + (p.y - snapPos.y));
+    const Point& a = snappedShape.origTri[(idx + 1) % 3];
+    const Point& b = snappedShape.origTri[(idx + 2) % 3];
+    double abLen = a.dist(b);
+    double area2 = std::abs((b.x - a.x) * (nextV.y - a.y) - (b.y - a.y) * (nextV.x - a.x));
+    if(abLen <= 1e-6 || (area2 / abLen) < 8.0)
+      return false;
+    snappedShape.tri[idx] = nextV;
+    return true;
+  }
   case SnappedShape::Arrow:
   case SnappedShape::Line: {
     Point nextEnd(snappedShape.origP2.x + (p.x - snapPos.x),
                   snappedShape.origP2.y + (p.y - snapPos.y));
     if(snappedShape.origP1.dist(nextEnd) < 4.0)
+      return false;
+    snappedShape.p2 = ShapeRecognizer::snapLineAngle(snappedShape.origP1, nextEnd);
+    return true;
+  }
+  case SnappedShape::CurvedArrow:
+  case SnappedShape::Arc: {
+    Point nextEnd(snappedShape.origP2.x + (p.x - snapPos.x),
+                  snappedShape.origP2.y + (p.y - snapPos.y));
+    if(snappedShape.origP1.dist(nextEnd) < 8.0)
       return false;
     snappedShape.p2 = nextEnd;
     return true;
@@ -283,11 +354,40 @@ void StrokedStrokeBuilder::rebuildSnappedStroke()
     stroke->closeSubpath();
     break;
   }
+  case SnappedShape::Ellipse: {
+    Point center = snappedShape.p1;
+    double rx = snappedShape.rx;
+    double ry = snappedShape.ry;
+    double ca = std::cos(snappedShape.angle);
+    double sa = std::sin(snappedShape.angle);
+    double approxPerim = M_PI * (rx + ry);
+    int numSegments = std::max(32, static_cast<int>(approxPerim / 4.0));
+    for(int i = 0; i < numSegments; ++i) {
+      double t = 2.0 * M_PI * i / numSegments;
+      double lx = rx * std::cos(t);
+      double ly = ry * std::sin(t);
+      double x = center.x + lx * ca - ly * sa;
+      double y = center.y + lx * sa + ly * ca;
+      if(i == 0)
+        stroke->moveTo(x, y);
+      else
+        stroke->lineTo(x, y);
+    }
+    stroke->closeSubpath();
+    break;
+  }
   case SnappedShape::Rectangle: {
     stroke->moveTo(snappedShape.p1.x, snappedShape.p1.y);
     stroke->lineTo(snappedShape.p2.x, snappedShape.p1.y);
     stroke->lineTo(snappedShape.p2.x, snappedShape.p2.y);
     stroke->lineTo(snappedShape.p1.x, snappedShape.p2.y);
+    stroke->closeSubpath();
+    break;
+  }
+  case SnappedShape::Triangle: {
+    stroke->moveTo(snappedShape.tri[0].x, snappedShape.tri[0].y);
+    stroke->lineTo(snappedShape.tri[1].x, snappedShape.tri[1].y);
+    stroke->lineTo(snappedShape.tri[2].x, snappedShape.tri[2].y);
     stroke->closeSubpath();
     break;
   }
@@ -302,7 +402,7 @@ void StrokedStrokeBuilder::rebuildSnappedStroke()
 
     double ux = (end.x - start.x) / shaftLen;
     double uy = (end.y - start.y) / shaftLen;
-    double headLength = std::max(10.0, width * 3.0);
+    double headLength = std::min(shaftLen * 0.45, std::max(11.0, width * 3.2));
     const double angleRad1 = 145.0 * M_PI / 180.0;
     const double angleRad2 = -145.0 * M_PI / 180.0;
     double hx1 = std::cos(angleRad1) * ux - std::sin(angleRad1) * uy;
@@ -312,6 +412,47 @@ void StrokedStrokeBuilder::rebuildSnappedStroke()
     stroke->moveTo(end.x + hx1 * headLength, end.y + hy1 * headLength);
     stroke->lineTo(end.x, end.y);
     stroke->lineTo(end.x + hx2 * headLength, end.y + hy2 * headLength);
+    break;
+  }
+  case SnappedShape::CurvedArrow:
+  case SnappedShape::Arc: {
+    Point center;
+    double radius = 0.0, startAngle = 0.0, sweepAngle = 0.0;
+    if(!ShapeRecognizer::calcArcGeometry(snappedShape.p1, snappedShape.p2, snappedShape.bulge,
+                                        center, radius, startAngle, sweepAngle)) {
+      stroke->moveTo(snappedShape.p1.x, snappedShape.p1.y);
+      stroke->lineTo(snappedShape.p2.x, snappedShape.p2.y);
+      break;
+    }
+    double arcLen = radius * std::abs(sweepAngle);
+    int numSegs = std::max(16, static_cast<int>(arcLen / 4.0));
+    for(int i = 0; i <= numSegs; ++i) {
+      double t = double(i) / numSegs;
+      double a = startAngle + sweepAngle * t;
+      double x = center.x + radius * std::cos(a);
+      double y = center.y + radius * std::sin(a);
+      if(i == 0)
+        stroke->moveTo(x, y);
+      else
+        stroke->lineTo(x, y);
+    }
+    if(snappedShape.type == SnappedShape::CurvedArrow) {
+      Point end = snappedShape.p2;
+      double rxTip = (end.x - center.x) / radius;
+      double ryTip = (end.y - center.y) / radius;
+      double ux = (sweepAngle >= 0.0) ? -ryTip : ryTip;
+      double uy = (sweepAngle >= 0.0) ? rxTip : -rxTip;
+      double headLength = std::min(arcLen * 0.45, std::max(11.0, width * 3.2));
+      const double angleRad1 = 145.0 * M_PI / 180.0;
+      const double angleRad2 = -145.0 * M_PI / 180.0;
+      double hx1 = std::cos(angleRad1) * ux - std::sin(angleRad1) * uy;
+      double hy1 = std::sin(angleRad1) * ux + std::cos(angleRad1) * uy;
+      double hx2 = std::cos(angleRad2) * ux - std::sin(angleRad2) * uy;
+      double hy2 = std::sin(angleRad2) * ux + std::cos(angleRad2) * uy;
+      stroke->moveTo(end.x + hx1 * headLength, end.y + hy1 * headLength);
+      stroke->lineTo(end.x, end.y);
+      stroke->lineTo(end.x + hx2 * headLength, end.y + hy2 * headLength);
+    }
     break;
   }
   case SnappedShape::Line:
@@ -690,6 +831,50 @@ void FilledStrokeBuilder::rebuildSnappedStroke()
     }
     break;
   }
+  case SnappedShape::Ellipse: {
+    Point center = snappedShape.p1;
+    double rx = snappedShape.rx;
+    double ry = snappedShape.ry;
+    double ca = std::cos(snappedShape.angle);
+    double sa = std::sin(snappedShape.angle);
+    double approxPerim = M_PI * (rx + ry);
+    int numSegments = std::max(28, static_cast<int>(approxPerim / 5.0));
+
+    Path2D outerEllipse;
+    for (int i = 0; i < numSegments; ++i) {
+      double t = 2.0 * M_PI * i / numSegments;
+      double lx = (rx + halfWidth) * std::cos(t);
+      double ly = (ry + halfWidth) * std::sin(t);
+      double x = center.x + lx * ca - ly * sa;
+      double y = center.y + lx * sa + ly * ca;
+      if (i == 0)
+        outerEllipse.moveTo(x, y);
+      else
+        outerEllipse.lineTo(x, y);
+    }
+    outerEllipse.closeSubpath();
+
+    stroke->clear();
+    stroke->connectPath(outerEllipse);
+
+    if (rx > halfWidth + 0.5 && ry > halfWidth + 0.5) {
+      Path2D innerEllipse;
+      for (int i = 0; i < numSegments; ++i) {
+        double t = 2.0 * M_PI * i / numSegments;
+        double lx = (rx - halfWidth) * std::cos(t);
+        double ly = (ry - halfWidth) * std::sin(t);
+        double x = center.x + lx * ca - ly * sa;
+        double y = center.y + lx * sa + ly * ca;
+        if (i == 0)
+          innerEllipse.moveTo(x, y);
+        else
+          innerEllipse.lineTo(x, y);
+      }
+      innerEllipse.closeSubpath();
+      stroke->connectPath(innerEllipse.toReversed());
+    }
+    break;
+  }
   case SnappedShape::Rectangle: {
     double avgLeftX   = snappedShape.p1.x;
     double avgTopY    = snappedShape.p1.y;
@@ -727,6 +912,12 @@ void FilledStrokeBuilder::rebuildSnappedStroke()
     }
     break;
   }
+  case SnappedShape::Triangle: {
+    stroke->clear();
+    for (int i = 0; i < 3; ++i)
+      addRoundSubpath(*stroke, snappedShape.tri[i], pen.width, snappedShape.tri[(i + 1) % 3], pen.width);
+    break;
+  }
   case SnappedShape::Arrow: {
     Point start = snappedShape.p1;
     Point end = snappedShape.p2;
@@ -736,98 +927,71 @@ void FilledStrokeBuilder::rebuildSnappedStroke()
     if (shaftLen <= 1e-6)
       break;
 
-    double headLength = std::max(10.0, pen.width * 2.5);
+    double headLength = std::min(shaftLen * 0.45, std::max(11.0, pen.width * 3.2));
     double ux = dx / shaftLen;
     double uy = dy / shaftLen;
-    double px = -uy;
-    double py = ux;
-
-    Point a = { start.x + px * halfWidth, start.y + py * halfWidth };
-    Point b = { start.x - px * halfWidth, start.y - py * halfWidth };
-    Point c = { end.x   - px * halfWidth, end.y   - py * halfWidth };
-    Point d = { end.x   + px * halfWidth, end.y   + py * halfWidth };
-
-    Path2D shaft;
-    shaft.moveTo(a.x, a.y);
-    shaft.lineTo(b.x, b.y);
-    shaft.lineTo(c.x, c.y);
-    shaft.lineTo(d.x, d.y);
-    shaft.closeSubpath();
-
-    const double angleRad1 = 135.0 * M_PI / 180.0;
-    double hx = std::cos(angleRad1) * ux - std::sin(angleRad1) * uy;
-    double hy = std::sin(angleRad1) * ux + std::cos(angleRad1) * uy;
-
-    const double angleRad2 = -135.0 * M_PI / 180.0;
+    const double angleRad1 = 145.0 * M_PI / 180.0;
+    const double angleRad2 = -145.0 * M_PI / 180.0;
+    double hx1 = std::cos(angleRad1) * ux - std::sin(angleRad1) * uy;
+    double hy1 = std::sin(angleRad1) * ux + std::cos(angleRad1) * uy;
     double hx2 = std::cos(angleRad2) * ux - std::sin(angleRad2) * uy;
     double hy2 = std::sin(angleRad2) * ux + std::cos(angleRad2) * uy;
-
-    Point tip1 = {end.x + hx * headLength, end.y + hy * headLength};
-    Point tip2 = {end.x + hx2 * headLength, end.y + hy2 * headLength};
-
-    double pxHead1 = -hy;
-    double pyHead1 = hx;
-    double pxHead2 = -hy2;
-    double pyHead2 = hx2;
-
-    Point ha1 = { end.x + pxHead1 * halfWidth, end.y + pyHead1 * halfWidth };
-    Point hb1 = { end.x - pxHead1 * halfWidth, end.y - pyHead1 * halfWidth };
-    Point hc1 = { tip1.x - pxHead1 * halfWidth, tip1.y - pyHead1 * halfWidth };
-    Point hd1 = { tip1.x + pxHead1 * halfWidth, tip1.y + pyHead1 * halfWidth };
-
-    Point ha2 = { end.x + pxHead2 * halfWidth, end.y + pyHead2 * halfWidth };
-    Point hb2 = { end.x - pxHead2 * halfWidth, end.y - pyHead2 * halfWidth };
-    Point hc2 = { tip2.x - pxHead2 * halfWidth, tip2.y - pyHead2 * halfWidth };
-    Point hd2 = { tip2.x + pxHead2 * halfWidth, tip2.y + pyHead2 * halfWidth };
-
-    Path2D headLine1;
-    headLine1.moveTo(ha1.x, ha1.y);
-    headLine1.lineTo(hb1.x, hb1.y);
-    headLine1.lineTo(hc1.x, hc1.y);
-    headLine1.lineTo(hd1.x, hd1.y);
-    headLine1.closeSubpath();
-
-    Path2D headLine2;
-    headLine2.moveTo(ha2.x, ha2.y);
-    headLine2.lineTo(hb2.x, hb2.y);
-    headLine2.lineTo(hc2.x, hc2.y);
-    headLine2.lineTo(hd2.x, hd2.y);
-    headLine2.closeSubpath();
+    Point tip1(end.x + hx1 * headLength, end.y + hy1 * headLength);
+    Point tip2(end.x + hx2 * headLength, end.y + hy2 * headLength);
 
     stroke->clear();
-    stroke->connectPath(shaft);
-    stroke->connectPath(headLine1);
-    stroke->connectPath(headLine2);
+    addRoundSubpath(*stroke, start, pen.width, end, pen.width);
+    addRoundSubpath(*stroke, end, pen.width, tip1, pen.width);
+    addRoundSubpath(*stroke, end, pen.width, tip2, pen.width);
+    break;
+  }
+  case SnappedShape::CurvedArrow:
+  case SnappedShape::Arc: {
+    stroke->clear();
+    Point center;
+    double radius = 0.0, startAngle = 0.0, sweepAngle = 0.0;
+    if (!ShapeRecognizer::calcArcGeometry(snappedShape.p1, snappedShape.p2, snappedShape.bulge,
+                                          center, radius, startAngle, sweepAngle)) {
+      addRoundSubpath(*stroke, snappedShape.p1, pen.width, snappedShape.p2, pen.width);
+      break;
+    }
+    double arcLen = radius * std::abs(sweepAngle);
+    int numSegs = std::max(16, static_cast<int>(arcLen / 4.0));
+    Point prev(center.x + radius * std::cos(startAngle), center.y + radius * std::sin(startAngle));
+    for (int i = 1; i <= numSegs; ++i) {
+      double t = double(i) / numSegs;
+      double a = startAngle + sweepAngle * t;
+      Point cur(center.x + radius * std::cos(a), center.y + radius * std::sin(a));
+      addRoundSubpath(*stroke, prev, pen.width, cur, pen.width);
+      prev = cur;
+    }
+    if (snappedShape.type == SnappedShape::CurvedArrow) {
+      Point end = snappedShape.p2;
+      double rxTip = (end.x - center.x) / radius;
+      double ryTip = (end.y - center.y) / radius;
+      double ux = (sweepAngle >= 0.0) ? -ryTip : ryTip;
+      double uy = (sweepAngle >= 0.0) ? rxTip : -rxTip;
+      double headLength = std::min(arcLen * 0.45, std::max(11.0, pen.width * 3.2));
+      const double angleRad1 = 145.0 * M_PI / 180.0;
+      const double angleRad2 = -145.0 * M_PI / 180.0;
+      double hx1 = std::cos(angleRad1) * ux - std::sin(angleRad1) * uy;
+      double hy1 = std::sin(angleRad1) * ux + std::cos(angleRad1) * uy;
+      double hx2 = std::cos(angleRad2) * ux - std::sin(angleRad2) * uy;
+      double hy2 = std::sin(angleRad2) * ux + std::cos(angleRad2) * uy;
+      Point tip1(end.x + hx1 * headLength, end.y + hy1 * headLength);
+      Point tip2(end.x + hx2 * headLength, end.y + hy2 * headLength);
+      addRoundSubpath(*stroke, end, pen.width, tip1, pen.width);
+      addRoundSubpath(*stroke, end, pen.width, tip2, pen.width);
+    }
     break;
   }
   case SnappedShape::Line: {
     Point start = snappedShape.p1;
     Point end = snappedShape.p2;
-    double dx = end.x - start.x;
-    double dy = end.y - start.y;
-    double length = std::hypot(dx, dy);
-    if (length <= 1e-6)
+    if (start.dist(end) <= 1e-6)
       break;
-
-    double ux = dx / length;
-    double uy = dy / length;
-    double px = -uy;
-    double py = ux;
-
-    Point a = { start.x + px * halfWidth, start.y + py * halfWidth };
-    Point b = { start.x - px * halfWidth, start.y - py * halfWidth };
-    Point c = { end.x   - px * halfWidth, end.y   - py * halfWidth };
-    Point d = { end.x   + px * halfWidth, end.y   + py * halfWidth };
-
-    Path2D linePath;
-    linePath.moveTo(a.x, a.y);
-    linePath.lineTo(b.x, b.y);
-    linePath.lineTo(c.x, c.y);
-    linePath.lineTo(d.x, d.y);
-    linePath.closeSubpath();
-
     stroke->clear();
-    stroke->connectPath(linePath);
+    addRoundSubpath(*stroke, start, pen.width, end, pen.width);
     break;
   }
   default:
